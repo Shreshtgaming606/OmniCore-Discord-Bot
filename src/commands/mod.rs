@@ -3,6 +3,8 @@ pub(crate) mod basic_utils;
 pub(crate) mod moderation;
 pub(crate) mod owner_commands;
 
+use crate::CustomContext;
+use poise::serenity_prelude::{Member, Role, RoleId};
 use poise::{
     CreateReply,
     serenity_prelude::{Colour, CreateAllowedMentions, CreateEmbed, Timestamp},
@@ -75,4 +77,39 @@ pub fn parse_duration(input: &str) -> Result<Duration, DurationParseError> {
     }
 
     Ok(Duration::from_secs(total_secs))
+}
+
+#[derive(Debug)]
+pub enum RoleCompareResult {
+    Greater,
+    Equal,
+    Less,
+}
+
+// Helper function to compare two roles by their position
+pub fn compare_roles(role1: &Role, role2: &Role) -> RoleCompareResult {
+    let role1_position = role1.position;
+    let role2_position = role2.position;
+
+    match role1_position.cmp(&role2_position) {
+        std::cmp::Ordering::Greater => RoleCompareResult::Greater,
+        std::cmp::Ordering::Equal => RoleCompareResult::Equal,
+        std::cmp::Ordering::Less => RoleCompareResult::Less,
+    }
+}
+
+pub fn get_highest_role_from_member(member: &Member, ctx: CustomContext<'_>) -> Option<RoleId> {
+    let mut highest_role_pos = 0;
+    let mut highest_role_id = None;
+
+    for role in &member.roles {
+        if let Some(role) = ctx.guild().unwrap().roles.get(&role) {
+            if role.position > highest_role_pos {
+                highest_role_pos = role.position;
+                highest_role_id = Some(role.id);
+            }
+        }
+    }
+
+    highest_role_id
 }

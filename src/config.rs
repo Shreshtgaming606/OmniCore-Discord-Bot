@@ -7,6 +7,9 @@ pub(crate) static MONGO_URI: OnceCell<String> = OnceCell::new();
 pub(crate) static OLLAMA_BASE_URL: OnceCell<String> = OnceCell::new();
 pub(crate) static OLLAMA_MODEL: OnceCell<String> = OnceCell::new();
 pub(crate) static BOT_OWNERS: OnceCell<Vec<u64>> = OnceCell::new();
+pub(crate) static START_SHARD: OnceCell<u32> = OnceCell::new();
+pub(crate) static END_SHARD: OnceCell<u32> = OnceCell::new();
+pub(crate) static TOTAL_SHARDS: OnceCell<u32> = OnceCell::new();
 
 pub(crate) fn init_config() {
     dotenv().ok();
@@ -35,6 +38,24 @@ pub(crate) fn init_config() {
         .map(|s| s.trim().parse::<u64>().expect("Invalid BOT_OWNERS value"))
         .collect::<Vec<u64>>();
     BOT_OWNERS.set(bot_owners).unwrap();
+
+    let start_shard = env::var("START_SHARD")
+        .unwrap_or("0".to_string())
+        .parse::<u32>()
+        .expect("Invalid START_SHARD value");
+    START_SHARD.set(start_shard).unwrap();
+
+    let end_shard = env::var("END_SHARD")
+        .unwrap_or("4".to_string())
+        .parse::<u32>()
+        .expect("Invalid END_SHARD value");
+    END_SHARD.set(end_shard).unwrap();
+
+    let total_shards = env::var("TOTAL_SHARDS")
+        .unwrap_or("5".to_string())
+        .parse::<u32>()
+        .expect("Invalid TOTAL_SHARDS value");
+    TOTAL_SHARDS.set(total_shards).unwrap();
 
     log::info!("Config initialized!");
 }

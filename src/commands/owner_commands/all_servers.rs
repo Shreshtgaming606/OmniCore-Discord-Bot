@@ -19,6 +19,7 @@ use poise::{
 )]
 pub async fn all_servers(ctx: CustomContext<'_>) -> Result<(), Error> {
     //! Lists all servers the bot is in, along with their member counts, owner, image, and ID.
+    ctx.defer().await?;
 
     let mut guilds = ctx.http().get_guilds(None, None).await?;
     guilds.sort_by(|a, b| a.name.cmp(&b.name));

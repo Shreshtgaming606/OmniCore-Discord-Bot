@@ -1,5 +1,11 @@
+pub mod allroles;
+pub mod compare_roles;
+pub mod emoji_info;
 pub mod help;
+pub mod highest_role_from_member;
 pub(crate) mod info;
 pub(crate) mod ping;
 pub(crate) mod prefix;
+pub mod role;
 pub mod server_info;
+pub mod user_info;
