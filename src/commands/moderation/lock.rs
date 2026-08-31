@@ -29,13 +29,16 @@ pub(crate) async fn lock(
     //! Locks a channel.
     //!
     //! Locks a channel by placing a lock role above the specified role, applying it to every user, and apply it to the channel.
+    ctx.defer().await?;
+
     let guild_id = ctx
         .guild_id()
         .ok_or("This command must be used in a guild")?;
 
     let locked_channels_col =
         get_collection("locked_channels").expect("Failed to load locked_channels collection");
-
+    //TODO: Check if we already have a lock role, if so, re use it and apply it to the channel.
+    //Also add the role to users that don't have it already.
     let _ = match locked_channels_col
         .find_one(doc! {
             "guild_id": guild_id.get().to_string(),

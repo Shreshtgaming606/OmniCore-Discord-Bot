@@ -71,6 +71,15 @@ pub(crate) async fn on_mention(
         return Ok(());
     };
 
+    let owners = BOT_OWNERS
+        .get()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .map(|id| format!("<@{}>", id))
+        .collect::<Vec<String>>()
+        .join(", ");
+
     // Check if the guild is approved for AI usage
     let per_guild_settings_col =
         get_collection("per_guild_settings").expect("Failed to load per_guild_settings collection");
@@ -79,14 +88,6 @@ pub(crate) async fn on_mention(
         .await?
         .ok_or("Guild settings not found")?;
     if guild_settings.get_bool("ai_approved").unwrap_or(false) == false {
-        let owners = BOT_OWNERS
-            .get()
-            .unwrap()
-            .clone()
-            .into_iter()
-            .map(|id| format!("<@{}>", id))
-            .collect::<Vec<String>>()
-            .join(", ");
         msg.reply(ctx.http.clone(), format!("This server is not approved for AI usage.\nYou can DM the users below with your Guild ID and ask to approve AI usage:\n{}\nYour Guild ID is `{}`", owners, guild_id.to_string())).await?;
         return Ok(());
     }
@@ -173,7 +174,7 @@ pub(crate) async fn on_mention(
     messages.insert(
         0,
         Bson::Document(doc! {
-            "content": SYSTEM_PROMPT.to_string().replace("<BOT_USER_ID>", &framework.bot_id.to_string()).replace("<CUSTOM_SYSTEM_PROMPT>", &custom_system_prompt),
+            "content": SYSTEM_PROMPT.to_string().replace("<BOT_USER_ID>", &framework.bot_id.to_string()).replace("<CUSTOM_SYSTEM_PROMPT>", &custom_system_prompt).replace("<BOT_OWNERS>", &owners),
             "author": {
                 "id": "0".to_string(),
                 "name": "System".to_string(),
@@ -187,7 +188,7 @@ pub(crate) async fn on_mention(
             "guild": {
                 "owner": { "id": "0".to_string() }
             },
-            "role": "SYSTEM".to_string(),
+            "role": "SYSTEM".to_string()
         }),
     );
 
@@ -311,7 +312,7 @@ pub(crate) async fn on_mention(
                 "human_time": Utc::now().to_rfc3339(),
                 "channel": { "id": msg.channel_id.to_string(), "name": channel_name.clone() },
                 "guild": { "owner": { "id": guild_owner_id.clone() } },
-                "role": "TOOL".to_string(),
+                "role": "TOOL".to_string()
             };
             if let Err(e) = messages_col
                 .update_one(

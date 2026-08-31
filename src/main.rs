@@ -18,8 +18,10 @@ use serenity::model::gateway::Ready;
 use serenity::model::user::OnlineStatus;
 use serenity::prelude::*;
 use std::collections::HashSet;
+use std::time::Duration;
 use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal};
+use serenity::cache::Settings as CacheSettings;
 
 #[derive(Clone, Debug, Copy)]
 struct Data {}
@@ -32,7 +34,7 @@ static OLLAMA: OnceCell<Ollama> = OnceCell::new();
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         let guilds = ready
             .guilds
             .to_vec()
@@ -45,6 +47,10 @@ impl EventHandler for Handler {
             ready.shard.unwrap().id,
             ready.user.name,
             guilds
+        );
+        ctx.shard.set_presence(
+            Some(ActivityData::custom("/help | OmniCore Discord Bot",)),
+            OnlineStatus::Online,
         );
     }
 }
@@ -344,9 +350,13 @@ async fn main() {
                 })
             })
             .build();
-
+    
+    let mut cache_settings = CacheSettings::default();
+    cache_settings.time_to_live = Duration::from_mins(10);
+    
     let client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
+        .cache_settings(cache_settings)
         .event_handler(Handler)
         .await;
 
