@@ -22,7 +22,7 @@ pub async fn kick_self(
     #[autocomplete = "autocomplete_guild"]
     guild: String,
 ) -> Result<(), Error> {
-    //! Kicks the bot from the specified server.
+    //! Kicks/leaves the bot from the specified server.
     let typing = poise::serenity_prelude::Typing::start(
         ctx.serenity_context().http.clone(),
         ctx.channel_id(),

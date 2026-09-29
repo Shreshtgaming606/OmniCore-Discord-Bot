@@ -7,6 +7,8 @@ use poise::serenity_prelude::{
     Error as SError, ErrorResponse, HttpError, Member, Mentionable, StatusCode, Timestamp,
 };
 
+const MAX_DELETE_MESSAGE_DAYS: u8 = 7;
+
 #[poise::command(
     slash_command,
     prefix_command,
@@ -21,7 +23,7 @@ use poise::serenity_prelude::{
 pub(crate) async fn ban(
     ctx: CustomContext<'_>,
     #[description = "Member to ban"] member: Member,
-    #[description = "How much of their recent messages to delete"] delete_message_days: Option<u8>,
+    #[description = "How much of their recent messages to delete (Max 7 days)"] delete_message_days: Option<u8>,
     #[description = "Reason for the ban"]
     #[rest]
     reason: Option<String>, // #[rest] uses the rest of the message as the reason
@@ -87,8 +89,23 @@ pub(crate) async fn ban(
 
     let reason = format!("{} | Banned by {}", reason_pre, ctx.author().tag());
 
+    let delete_days = delete_message_days.unwrap_or(0);
+    if delete_days > MAX_DELETE_MESSAGE_DAYS {
+        let res = build_message_reply(
+            ":x: Invalid Argument",
+            &format!(
+                "`delete_message_days` must be between 0 and {}.",
+                MAX_DELETE_MESSAGE_DAYS
+            ),
+            Colour::from_rgb(255, 0, 0),
+            true,
+        );
+        ctx.send(res).await?;
+        return Ok(());
+    }
+
     match member
-        .ban_with_reason(&ctx.http(), delete_message_days.unwrap_or(0), &reason)
+        .ban_with_reason(&ctx.http(), delete_days, &reason)
         .await
     {
         Ok(_) => {}

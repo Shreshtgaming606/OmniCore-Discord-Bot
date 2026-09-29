@@ -4,7 +4,7 @@ use crate::config::BOT_OWNERS;
 use crate::database::get_collection;
 use crate::{CustomContext, Error, get_guild_name};
 use futures::stream::{self, StreamExt};
-use mongodb::bson::doc;
+use mongodb::bson::{doc, Document};
 use poise::CreateReply;
 use poise::serenity_prelude::Colour;
 use poise::serenity_prelude::{
@@ -12,6 +12,8 @@ use poise::serenity_prelude::{
 };
 use reqwest;
 use std::collections::HashMap;
+use futures::TryStreamExt;
+use mongodb::Collection;
 
 const CONCURRENCY: usize = 5;
 async fn get_contributors() -> Result<HashMap<String, String>, reqwest::Error> {
@@ -75,6 +77,36 @@ async fn get_channel_and_member_counts(ctx: CustomContext<'_>) -> (usize, usize)
     (total_channels, total_members)
 }
 
+async fn total_messages(coll: &Collection<Document>) -> mongodb::error::Result<i64> {
+    let pipeline = vec![
+        doc! {
+            "$group": {
+                "_id": null,
+                "total": {
+                    "$sum": {
+                        // $ifNull protects for docs that dont have messages
+                        // $isArray protects against non-array values
+                        "$cond": [
+                            { "$isArray": "$messages" },
+                            { "$size": "$messages" },
+                            0
+                        ]
+                    }
+                }
+            }
+        },
+    ];
+
+    let mut cursor = coll.aggregate(pipeline).await?;
+    let total = match cursor.try_next().await? {
+        Some(d) => d.get_i32("total").map(i64::from)
+            .or_else(|_| d.get_i64("total"))
+            .unwrap_or(0),
+        None => 0, // empty collection
+    };
+    Ok(total)
+}
+
 #[poise::command(
     slash_command,
     prefix_command,
@@ -131,6 +163,9 @@ pub(crate) async fn info(ctx: CustomContext<'_>) -> Result<(), Error> {
     let mut ai_approved = false;
     let mut messages_processed = 0;
 
+    let messages_col =
+        get_collection("messages").expect("Failed to load messages collection");
+
     if ctx.guild_id().is_some() {
         let per_guild_settings_col = get_collection("per_guild_settings")
             .expect("Failed to load per_guild_settings collection");
@@ -143,8 +178,7 @@ pub(crate) async fn info(ctx: CustomContext<'_>) -> Result<(), Error> {
             crate::setup_guild(ctx.guild_id().unwrap_or(GuildId::new(1))).await;
         } else {
             let guild_settings = guild_settings.unwrap();
-            let messages_col =
-                get_collection("messages").expect("Failed to load messages collection");
+
             ai_approved = guild_settings
                 .get("ai_approved")
                 .and_then(|v| v.as_bool())
@@ -161,15 +195,19 @@ pub(crate) async fn info(ctx: CustomContext<'_>) -> Result<(), Error> {
         }
     }
 
+    let total_messages = total_messages(&messages_col).await?;
+
     let ai_desc = format!(
         "\
 - AI Approved: `{}`
 - AI Model: `{}`
-- Messages processed: `{}`
+- Messages processed (for this server): `{}`
+- Messages processed (global): `{}`
         ",
         ai_approved,
         crate::config::OLLAMA_MODEL.get().unwrap(),
-        messages_processed
+        messages_processed,
+        total_messages
     );
 
     let contributors = get_contributors().await?;

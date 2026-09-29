@@ -6,18 +6,18 @@ use poise::serenity_prelude::{Colour, GuildId};
 #[poise::command(
     slash_command,
     prefix_command,
-    description_localized("en-US", "Sets the prefix for the bot"),
+    description_localized("en-US", "Changes the prefix for the bot"),
     guild_only,
     required_permissions = "MANAGE_GUILD",
     default_member_permissions = "MANAGE_GUILD",
     broadcast_typing,
     category = "Utility"
 )]
-pub(crate) async fn set_prefix(
+pub(crate) async fn change_prefix(
     ctx: CustomContext<'_>,
-    #[description = "What you want to set the prefix to"] new_prefix: String,
+    #[description = "What you want to change the prefix to"] new_prefix: String,
 ) -> Result<(), Error> {
-    //! Sets the prefix for the bot
+    //! Changes the prefix for the bot
     let per_guild_settings_col =
         get_collection("per_guild_settings").expect("Failed to load per_guild_settings collection");
 

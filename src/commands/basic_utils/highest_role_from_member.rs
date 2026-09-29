@@ -6,6 +6,7 @@ use poise::serenity_prelude::{
     Timestamp,
 };
 
+/// Shows the highest role assigned to a specific member.
 #[poise::command(
     slash_command,
     prefix_command,

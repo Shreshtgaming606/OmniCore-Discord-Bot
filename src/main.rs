@@ -1,3 +1,12 @@
+//! OmniCore Discord Bot
+//!
+//! This binary wires together configuration loading, MongoDB, Ollama, command
+//! registration, and Discord event handling. The startup flow is:
+//! 1. initialize logging and environment-backed config
+//! 2. connect to MongoDB and Ollama
+//! 3. register all slash/prefix commands globally
+//! 4. start the Discord shard range and listen for shutdown signals
+
 mod commands;
 mod config;
 mod database;
@@ -6,13 +15,13 @@ mod logging;
 use crate::commands::ai::init_ollama::init_ollama;
 use mongodb::bson::doc;
 use ollama_rs::Ollama;
-use once_cell::sync::OnceCell;
 use poise::serenity_prelude::Permissions;
 use poise::{
     Command, CreateReply, FrameworkError,
     serenity_prelude::{self as serenity, Colour, CreateEmbed, GuildId, Timestamp},
 };
 use serenity::async_trait;
+use serenity::cache::Settings as CacheSettings;
 use serenity::gateway::ActivityData;
 use serenity::model::gateway::Ready;
 use serenity::model::user::OnlineStatus;
@@ -21,16 +30,21 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal};
-use serenity::cache::Settings as CacheSettings;
+use tokio::sync::OnceCell;
 
+/// Shared runtime state passed into poise command handlers.
 #[derive(Clone, Debug, Copy)]
 struct Data {}
 type Error = Box<dyn std::error::Error + Send + Sync>;
+/// Convenience alias for the bot's command context type.
 type CustomContext<'a> = poise::Context<'a, Data, Error>;
+/// Discord event handler used for presence setup and mention routing.
 struct Handler;
 
-static START_TIME: OnceCell<chrono::DateTime<chrono::Utc>> = OnceCell::new();
-static OLLAMA: OnceCell<Ollama> = OnceCell::new();
+/// Timestamp recorded when the process starts. (used in /info command)
+static START_TIME: OnceCell<chrono::DateTime<chrono::Utc>> = OnceCell::const_new();
+/// Lazily initialized Ollama client shared across mention handlers.
+static OLLAMA: OnceCell<Ollama> = OnceCell::const_new();
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -49,12 +63,13 @@ impl EventHandler for Handler {
             guilds
         );
         ctx.shard.set_presence(
-            Some(ActivityData::custom("/help | OmniCore Discord Bot",)),
+            Some(ActivityData::custom("/help | OmniCore Discord Bot")),
             OnlineStatus::Online,
         );
     }
 }
 
+/// Returns the best available display name for the current command author.
 async fn get_user_name(ctx: &CustomContext<'_>) -> String {
     if ctx.guild_id().is_none() {
         return ctx.author().name.clone();
@@ -65,6 +80,7 @@ async fn get_user_name(ctx: &CustomContext<'_>) -> String {
     )
 }
 
+/// Returns a human-readable guild name, or a DM placeholder when applicable.
 async fn get_guild_name(ctx: &CustomContext<'_>) -> String {
     if ctx.guild_id().is_none() {
         return "DMs (not an actual server)".to_string();
@@ -72,14 +88,16 @@ async fn get_guild_name(ctx: &CustomContext<'_>) -> String {
     ctx.guild().unwrap().name.clone()
 }
 
+/// Returns the guild owner ID for guild commands, or an invalid value in DMs.
 #[allow(dead_code)]
 async fn get_guild_owner_id(ctx: &CustomContext<'_>) -> serenity::UserId {
     if ctx.guild_id().is_none() {
-        return serenity::UserId::new(1); // Invalid, so nothing can point to it.
+        return serenity::UserId::new(1); // Discord doesn't have a user id of 1, and 0 isn't allowed in serenity
     }
     ctx.guild().unwrap().owner_id
 }
 
+/// Routes Discord message events that mention or reply to the bot.
 async fn event_handler(
     ctx: &Context,
     event: &serenity::FullEvent,
@@ -116,6 +134,7 @@ async fn event_handler(
     Ok(())
 }
 
+/// Delegates mention handling to the AI integration layer.
 async fn handle_bot_mention(
     ctx: &Context,
     msg: &serenity::Message,
@@ -128,6 +147,7 @@ async fn handle_bot_mention(
     Ok(())
 }
 
+/// Bootstraps the bot, registers commands, and starts shard processing.
 #[tokio::main]
 async fn main() {
     START_TIME
@@ -154,13 +174,12 @@ async fn main() {
 
     let cmds: Vec<Command<Data, Box<dyn std::error::Error + Send + Sync>>> = vec![
         commands::basic_utils::ping::ping(),
-        commands::basic_utils::prefix::set_prefix(),
+        commands::basic_utils::prefix::change_prefix(),
         commands::basic_utils::info::info(),
         commands::basic_utils::help::help(),
         commands::basic_utils::compare_roles::compare_roles_f(),
         commands::basic_utils::role::role(),
         commands::basic_utils::highest_role_from_member::highest_role_from_member(),
-        commands::basic_utils::allroles::roles_all(),
         commands::basic_utils::server_info::serverinfo(),
         commands::moderation::kick::kick(),
         commands::moderation::ban::ban(),
@@ -175,13 +194,15 @@ async fn main() {
         commands::ai::delete_memory::delete_memory(),
         commands::ai::change_prompt::change_prompt(),
         commands::ai::get_prompt::get_prompt(),
-        commands::ai::remove_prompt::remove_prompt(),
+        commands::ai::delete_prompt::delete_prompt(),
         commands::owner_commands::all_servers::all_servers(),
         commands::owner_commands::create_invite::create_invite(),
         commands::owner_commands::kick_self::kick_self(),
     ];
 
     let token = config::DISCORD_TOKEN.get().unwrap();
+    // # Warning:
+    // Bot **WILL** fail to start if the application related to the token doesn't have these intents enabled.
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::privileged()
         | GatewayIntents::non_privileged()
@@ -196,6 +217,7 @@ async fn main() {
             owners,
             commands: cmds,
             event_handler: |ctx, event, framework, data| {
+                // pass off events to event_handler
                 Box::pin(event_handler(ctx, event, framework, data))
             },
             command_check: Some(|ctx| {
@@ -206,6 +228,8 @@ async fn main() {
             }),
             on_error: |err| {
                 Box::pin(async move {
+                    // If it's one of these, return a better error message.
+                    // `skip` is used to prevent double logging.
                     #[allow(unused)]
                     let mut skip = false;
                     #[allow(unused)]
@@ -233,6 +257,8 @@ async fn main() {
                         _ => {}
                     }
 
+
+                    // If `Command` has dm_only
                     if dm_only {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -244,17 +270,7 @@ async fn main() {
                         return;
                     }
 
-                    if subcommand_required {
-                        let _ = err.ctx().unwrap().send(CreateReply::default().embed(
-                            CreateEmbed::new()
-                                .description("This command requires a subcommand.")
-                                .title(":x: Subcommand Required")
-                                .timestamp(Timestamp::now())
-                                .color(Colour::from_rgb(255, 0, 0)),
-                        ).reply(true).ephemeral(true)).await;
-                        return;
-                    }
-
+                    // If `Command` has guild_only
                     if guild_only {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -266,6 +282,20 @@ async fn main() {
                         return;
                     }
 
+                    // If `Command` has subcommand_required
+                    if subcommand_required {
+                        let _ = err.ctx().unwrap().send(CreateReply::default().embed(
+                            CreateEmbed::new()
+                                .description("This command requires a subcommand.")
+                                .title(":x: Subcommand Required")
+                                .timestamp(Timestamp::now())
+                                .color(Colour::from_rgb(255, 0, 0)),
+                        ).reply(true).ephemeral(true)).await;
+                        return;
+                    }
+
+                    // If any of the roles doesn't grant X(or more) permission but command requires X
+                    // permissions. Established in default_member_permissions and required_permissions for `Command`
                     if missing_user_permissions.is_some() {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -288,6 +318,7 @@ async fn main() {
                         return;
                     }
 
+                    // Setup in framework options
                     if not_an_owner {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -298,8 +329,7 @@ async fn main() {
                         ).reply(true).ephemeral(true)).await;
                     }
 
-
-
+                    // If it's not one of the errors above, log and tell the user.
                     if err.ctx().is_none() && !skip {
                         log::error!("Error while handling command (context is not available): {:#?}", err);
                     } else if !skip {
@@ -350,10 +380,10 @@ async fn main() {
                 })
             })
             .build();
-    
+
     let mut cache_settings = CacheSettings::default();
     cache_settings.time_to_live = Duration::from_mins(10);
-    
+
     let client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
         .cache_settings(cache_settings)
@@ -369,6 +399,8 @@ async fn main() {
         log::info!("Bot has been shutdown!");
     });
 
+    // Start the shard manager.
+    // Each process doesn't need to know about other processes, since Discord handles that.
     let start_shard = config::START_SHARD.get().unwrap();
     let end_shard = config::END_SHARD.get().unwrap();
     let total_shards = config::TOTAL_SHARDS.get().unwrap();
@@ -379,6 +411,7 @@ async fn main() {
         .expect("Failed to start shard range");
 }
 
+/// Waits for Ctrl+C or SIGTERM so the bot can shut down cleanly.
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -400,6 +433,7 @@ async fn shutdown_signal() {
     }
 }
 
+/// Inserts default per-guild settings when a guild is first seen.
 async fn setup_guild(guild: GuildId) {
     let guild_id = guild.get();
     let per_guild_settings_col = database::get_collection("per_guild_settings")

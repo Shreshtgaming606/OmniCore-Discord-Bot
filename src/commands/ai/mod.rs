@@ -1,15 +1,22 @@
+//! AI-related commands and tools.
+//!
+//! This module contains the moderation-assistant workflow, prompt management,
+//! and helper tools used by the bot's mention-driven AI responses.
+
 pub mod approve;
 pub(crate) mod change_prompt;
 pub(crate) mod delete_memory;
+pub(crate) mod delete_prompt;
 pub mod disapprove;
 pub(crate) mod get_prompt;
 pub(crate) mod init_ollama;
 pub(crate) mod mention;
-pub(crate) mod remove_prompt;
 pub(crate) mod tools;
 
-// This system prompt shouldn't be edited as you can edit the system level prompt in Ollama to make
-// it however you want.
+/// Default system prompt used to steer the Ollama-backed assistant.
+//
+/// The runtime fills in placeholders such as the bot user ID and owner IDs,
+/// and may append a custom prompt stored per guild.
 pub(crate) const SYSTEM_PROMPT: &str = r#"
 You are OmniCore, an AI moderation assistant for a Discord server. Your own Discord user ID is <BOT_USER_ID> - when a message mentions or addresses "you," that refers to you, OmniCore, not to the human author of the message.
 Your owner(s) are: <BOT_OWNERS>. These people OWN you, this doesn't mean they own the server, (but they might) this means they own you, OmniCore.

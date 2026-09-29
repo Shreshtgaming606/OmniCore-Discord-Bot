@@ -1808,7 +1808,6 @@ dependencies = [
  "log4rs",
  "mongodb",
  "ollama-rs",
- "once_cell",
  "poise",
  "regex",
  "reqwest 0.13.4",

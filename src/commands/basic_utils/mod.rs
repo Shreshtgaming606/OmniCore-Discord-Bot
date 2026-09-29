@@ -1,3 +1,5 @@
+//! General-purpose utility commands exposed to Discord users.
+
 pub mod allroles;
 pub mod compare_roles;
 pub mod emoji_info;

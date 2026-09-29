@@ -1,12 +1,15 @@
 use mongodb::{Client, bson::doc, options::ClientOptions};
-use once_cell::sync::OnceCell;
+use tokio::sync::OnceCell;
 
-pub static CLIENT: OnceCell<mongodb::Client> = OnceCell::new();
+/// Shared MongoDB client used by the bot.
+pub static CLIENT: OnceCell<mongodb::Client> = OnceCell::const_new();
 
+/// Placeholder for collection/index setup logic.
 pub async fn ensure_indexes() -> mongodb::error::Result<()> {
     Ok(())
 }
 
+/// Connects to MongoDB, verifies the server is reachable, and stores the client.
 pub async fn mongo_connect() -> mongodb::error::Result<()> {
     let mongodb_uri = crate::config::MONGO_URI.get().unwrap();
 
@@ -27,6 +30,7 @@ pub async fn mongo_connect() -> mongodb::error::Result<()> {
     Ok(())
 }
 
+/// Returns a typed handle to a collection in the bot's database.
 pub fn get_collection(
     collection_name: &str,
 ) -> Result<mongodb::Collection<mongodb::bson::Document>, mongodb::error::Error> {
@@ -38,6 +42,7 @@ pub fn get_collection(
         .collection::<mongodb::bson::Document>(collection_name))
 }
 
+/// Shuts down the shared MongoDB client if it was initialized.
 pub async fn mongo_shutdown() {
     log::info!("Attempting MongoDB shutdown...");
 

@@ -5,6 +5,7 @@ use poise::{
     serenity_prelude::{Colour, CreateAllowedMentions, CreateEmbed, Timestamp},
 };
 
+/// Lists every server the bot is currently in, including counts and owner info.
 #[poise::command(
     slash_command,
     prefix_command,
@@ -18,7 +19,6 @@ use poise::{
     category = "Bot Owner Utilities"
 )]
 pub async fn all_servers(ctx: CustomContext<'_>) -> Result<(), Error> {
-    //! Lists all servers the bot is in, along with their member counts, owner, image, and ID.
     ctx.defer().await?;
 
     let mut guilds = ctx.http().get_guilds(None, None).await?;

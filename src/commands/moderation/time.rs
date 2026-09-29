@@ -171,7 +171,7 @@ pub(crate) async fn time(
         .embed(
             CreateEmbed::new()
                 .description(format!(
-                    "User \"{}\" timed \"{}\" for reason \"{}\" and until <t:{}:F>",
+                    "{} timed {} for reason **{}** until <t:{}:F>",
                     ctx.author().mention(),
                     member.mention(),
                     reason_pre,

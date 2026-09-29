@@ -8,10 +8,12 @@ use poise::serenity_prelude::Colour;
     prefix_command,
     description_localized("en-US", "Removes the current system prompt for the bot."),
     guild_only,
+    required_permissions = "ADMINISTRATOR",
+    default_member_permissions = "ADMINISTRATOR",
     broadcast_typing,
     category = "AI"
 )]
-pub(crate) async fn remove_prompt(ctx: CustomContext<'_>) -> Result<(), Error> {
+pub(crate) async fn delete_prompt(ctx: CustomContext<'_>) -> Result<(), Error> {
     //! Removes the current system prompt for the bot
     let per_guild_settings_col =
         get_collection("per_guild_settings").expect("Failed to load per_guild_settings collection");

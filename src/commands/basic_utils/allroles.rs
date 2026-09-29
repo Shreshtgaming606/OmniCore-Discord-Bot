@@ -6,6 +6,7 @@ use poise::serenity_prelude::{
 
 const MAX_ROLES_DIGITS_SIZE: usize = 3; // max is 250
 
+/// Lists all roles in the current server, sorted from highest to lowest.
 #[poise::command(
     slash_command,
     prefix_command,

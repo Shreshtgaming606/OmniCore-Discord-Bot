@@ -2,6 +2,7 @@ use crate::{CustomContext, Error};
 use poise::CreateReply;
 use poise::serenity_prelude::{ChannelType, Colour, CreateAllowedMentions, CreateEmbed, Timestamp};
 
+/// Displays a summary of the current server's metadata and counts.
 #[poise::command(
     slash_command,
     prefix_command,

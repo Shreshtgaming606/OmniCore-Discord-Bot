@@ -1,9 +1,11 @@
+//! Owner-only command implementations and shared helpers.
+
 pub mod all_servers;
 pub mod create_invite;
 pub mod kick_self;
 use crate::CustomContext;
 
-/// Autocompletes guild choices by ID or name (case-insensitive substring match).
+/// Autocompletes guild choices by ID or name using a case-insensitive match.
 async fn autocomplete_guild(
     ctx: CustomContext<'_>,
     partial: &str,

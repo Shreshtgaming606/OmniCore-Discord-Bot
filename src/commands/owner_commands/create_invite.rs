@@ -3,6 +3,7 @@ use crate::{CustomContext, Error};
 use poise::serenity_prelude::GuildId;
 use poise::serenity_prelude::{ChannelType, CreateInvite};
 
+/// Creates a one-use invite for a guild the bot is already in.
 #[poise::command(
     slash_command,
     description_localized("en-US", "Creates an invite for the specified server."),
@@ -16,7 +17,6 @@ pub async fn create_invite(
     #[autocomplete = "autocomplete_guild"]
     guild: String,
 ) -> Result<(), Error> {
-    //! Creates an invite for the specified server.
     let typing = poise::serenity_prelude::Typing::start(
         ctx.serenity_context().http.clone(),
         ctx.channel_id(),
@@ -26,7 +26,7 @@ pub async fn create_invite(
         Ok(id) => GuildId::new(id),
         Err(_) => {
             ctx.say(
-                ":x: Invalid guild — please select a server from the autocomplete suggestions.",
+                ":x: Invalid guild - please select a server from the autocomplete suggestions.",
             )
             .await?;
             typing.stop();
