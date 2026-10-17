@@ -5,6 +5,7 @@ use crate::{
         provider::{self, ProviderError},
         storage::{AiError, ByokService},
     },
+    database,
 };
 use poise::{
     CreateReply,
@@ -114,16 +115,27 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
     if !owner(&ctx).await? {
         return Ok(());
     }
-    let Some(service) = service(&ctx) else {
-        return respond(&ctx, "Secure AI setup is not configured yet.").await;
-    };
     let guild = ctx.guild_id().ok_or("Guild required")?.get();
+    let approved = database::is_ai_approved(guild)
+        .await
+        .map_err(|_| "AI approval status unavailable")?;
+    let Some(service) = service(&ctx) else {
+        return respond(&ctx, if approved {
+            "This server is approved for local Ollama AI, including image recognition. A provider key is not needed for server messages."
+        } else {
+            "This server is not approved for local AI, and secure provider setup is unavailable right now. Ask the bot operators to check the setup service."
+        }).await;
+    };
     let connection = service
         .connection(guild)
         .await
         .map_err(|_| "AI settings unavailable")?;
     let Some(connection) = connection else {
-        return respond(&ctx, "No guild AI provider is connected. Run /ai setup to connect one. Existing locally hosted OmniCore AI may still be available if approved.").await;
+        return respond(&ctx, if approved {
+            "This server is approved for local Ollama AI, including image recognition. A provider key is not needed for server messages. /ai setup is optional for owner DM vision."
+        } else {
+            "This server is not approved for local AI and no provider is connected. The server owner can run /ai setup, or ask the bot owners to approve the server."
+        }).await;
     };
     let usage = service
         .usage(guild)
@@ -138,6 +150,15 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         && provider::supports_vision(connection.provider, vision_model);
     let embed = CreateEmbed::new()
         .title("OmniCore AI configuration")
+        .field(
+            "Server AI route",
+            if approved {
+                "Local Ollama (bot-owner approved)"
+            } else {
+                "Connected provider"
+            },
+            false,
+        )
         .field("Provider", connection.provider.name(), true)
         .field("Model", connection.model.clone(), true)
         .field(
@@ -335,8 +356,19 @@ pub async fn vision(
     let available = connection
         .as_ref()
         .is_some_and(|c| provider::supports_vision(c.provider, model_name));
-    respond(&ctx, &format!("Vision: {}. Model: `{model_name}`. Up to {} images per request. Owner DM vision: {}. Image requests count toward the server's existing daily AI limits and may incur additional provider charges.",
-        if current.vision_enabled == Some(false) { "disabled" } else if available { "enabled" } else { "unavailable until a vision-capable model is selected" }, current.max_images, if current.dm_vision_enabled { "enabled" } else { "disabled" })).await
+    let approved = database::is_ai_approved(guild)
+        .await
+        .map_err(|_| "AI approval status unavailable")?;
+    let server_route = if current.vision_enabled == Some(false) {
+        "disabled".to_string()
+    } else if approved {
+        "local Ollama (bot-owner approved)".to_string()
+    } else if available {
+        format!("connected provider ({model_name})")
+    } else {
+        "unavailable until /ai setup connects a vision-capable provider/model".to_string()
+    };
+    respond(&ctx, &format!("Server image route: {server_route}. Up to {} images per request. Owner DM vision: {}. Local and provider image requests count toward the server's daily AI limits; provider requests may incur charges.", current.max_images, if current.dm_vision_enabled { "enabled" } else { "disabled" })).await
 }
 
 #[poise::command(slash_command, guild_only, category = "AI")]

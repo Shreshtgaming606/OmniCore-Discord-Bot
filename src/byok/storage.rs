@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 pub const CREDENTIALS: &str = "guild_ai_credentials";
 pub const USAGE: &str = "ai_usage";
 pub const QUOTAS: &str = "ai_daily_quotas";
-const RETENTION_DAYS: i64 = 90;
+pub(crate) const RETENTION_DAYS: i64 = 90;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -165,7 +165,7 @@ pub struct ByokService {
     active: Arc<Mutex<HashMap<u64, u32>>>,
 }
 
-struct ActiveGuard {
+pub(crate) struct ActiveGuard {
     guild: u64,
     active: Arc<Mutex<HashMap<u64, u32>>>,
 }
@@ -356,6 +356,42 @@ impl ByokService {
         let connection = self.connection(guild).await?.ok_or(AiError::NotConnected)?;
         selected_vision_model(&limits, &connection)?;
         Ok(limits.max_images)
+    }
+    pub async fn local_vision_access(
+        &self,
+        guild: u64,
+        channel: u64,
+        roles: &[u64],
+    ) -> Result<(usize, u32), AiError> {
+        let limits = self.limits(guild).await?;
+        if limits.vision_enabled == Some(false) {
+            return Err(AiError::VisionDisabled);
+        }
+        if !allowed_here(&limits, channel, roles) {
+            return Err(AiError::Forbidden);
+        }
+        Ok((limits.max_images, limits.output_tokens as u32))
+    }
+    pub(crate) async fn begin_local_vision(
+        &self,
+        guild: u64,
+        user: u64,
+        channel: u64,
+        roles: &[u64],
+    ) -> Result<ActiveGuard, AiError> {
+        if !database::is_ai_approved(guild)
+            .await
+            .map_err(|_| AiError::Storage)?
+        {
+            return Err(AiError::Forbidden);
+        }
+        let limits = self.limits(guild).await?;
+        if limits.vision_enabled == Some(false) || !allowed_here(&limits, channel, roles) {
+            return Err(AiError::Forbidden);
+        }
+        let guard = self.acquire(guild, limits.concurrency)?;
+        self.reserve_quota(guild, user, &limits).await?;
+        Ok(guard)
     }
     async fn is_guild_owner(&self, guild: u64, user: u64) -> Result<bool, AiError> {
         let info = GuildId::new(guild)

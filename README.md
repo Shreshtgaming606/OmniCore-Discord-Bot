@@ -28,7 +28,7 @@ The server owner can also request a direct mute in chat: `@OmniCore mute @member
 
 The guild owner starts with `/ai setup`, opens the short-lived HTTPS link, signs in with Discord, and enters a provider key in the authenticated portal. Keys are encrypted per guild. `/ai status`, `/ai model`, `/ai usage`, `/ai limits`, `/ai channel`, `/ai role`, and `/ai disconnect` manage access and usage. Members can use `/ask` where the owner permits it. The bot's local AutoMod model does not charge the guild's provider account.
 
-Image questions addressed to OmniCore can use images attached to the invoking message or to its exact direct reply target. See [image recognition and privacy rules](docs/VISION.md), including `/ai vision` settings and owner-only DM opt-in.
+Image questions addressed to OmniCore use local Ollama in bot-owner-approved servers, or a connected provider in unapproved servers. They can use images attached to the invoking message or to its exact direct reply target. See [image recognition and privacy rules](docs/VISION.md), including `/ai vision` settings and owner-only DM opt-in.
 
 ## AI usage in development
 

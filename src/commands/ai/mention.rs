@@ -74,17 +74,6 @@ pub(crate) async fn on_mention(
         return Ok(());
     };
 
-    if let Some(service) = _data.byok.as_ref() {
-        if service
-            .connection(guild_id.get())
-            .await
-            .map_err(|_| "AI connection unavailable")?
-            .is_some()
-        {
-            return super::byok_commands::reply_to_mention(ctx, msg, service).await;
-        }
-    }
-
     let owners = BOT_OWNERS
         .get()
         .unwrap()
@@ -100,9 +89,18 @@ pub(crate) async fn on_mention(
     let guild_settings = per_guild_settings_col
         .find_one(doc! {"guild_id": guild_id.to_string()})
         .await?
-        .ok_or("Guild settings not found")?;
-    if guild_settings.get_bool("ai_approved").unwrap_or(false) == false {
-        msg.reply(ctx.http.clone(), format!("This server is not approved for AI usage.\nYou can DM the users below with your Guild ID and ask to approve AI usage:\n{}\nYour Guild ID is `{}`", owners, guild_id.to_string())).await?;
+        .unwrap_or_default();
+    if !guild_settings.get_bool("ai_approved").unwrap_or(false) {
+        if let Some(service) = _data.byok.as_ref()
+            && service
+                .connection(guild_id.get())
+                .await
+                .map_err(|_| "AI connection unavailable")?
+                .is_some()
+        {
+            return super::byok_commands::reply_to_mention(ctx, msg, service).await;
+        }
+        msg.reply(ctx.http.clone(), format!("This server is not approved for locally hosted AI. The server owner can run `/ai setup` to connect a provider, or ask the bot owners ({owners}) to approve this server. Server ID: `{guild_id}`.")).await?;
         return Ok(());
     }
 

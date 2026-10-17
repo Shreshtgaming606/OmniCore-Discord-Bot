@@ -17,6 +17,15 @@ pub const LOCKED_CHANNELS: &str = "locked_channels";
 pub const AUTOMOD_WARNINGS: &str = "automod_warnings";
 pub const AUTOMOD_WARNING_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
+pub async fn is_ai_approved(guild_id: u64) -> mongodb::error::Result<bool> {
+    let settings = get_collection(GUILD_SETTINGS)?
+        .find_one(doc! {"guild_id": guild_id.to_string()})
+        .await?;
+    Ok(settings
+        .as_ref()
+        .is_some_and(|document| document.get_bool("ai_approved").unwrap_or(false)))
+}
+
 fn guild_filter(guild_id: &str) -> Document {
     doc! { "guild_id": guild_id }
 }
