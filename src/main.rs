@@ -6,6 +6,7 @@ mod database;
 mod logging;
 mod moderation_events;
 mod retention;
+mod vision;
 
 use crate::commands::ai::init_ollama::init_ollama;
 use mongodb::bson::doc;
@@ -106,6 +107,17 @@ async fn event_handler(
                 .referenced_message
                 .as_ref()
                 .is_some_and(|referenced| referenced.author.id == bot_id);
+            let is_dm_vision = new_message.guild_id.is_none()
+                && vision::context::requests_image_analysis(
+                    &new_message.content,
+                    !new_message.attachments.is_empty()
+                        || new_message
+                            .referenced_message
+                            .as_ref()
+                            .is_some_and(|referenced| !referenced.attachments.is_empty()),
+                    new_message.message_reference.is_some()
+                        && new_message.referenced_message.is_none(),
+                );
             if (is_mentioned || is_reply_to_bot)
                 && commands::ai::owner_mute::maybe_handle(ctx, new_message, bot_id).await
             {
@@ -116,7 +128,7 @@ async fn event_handler(
                 return Ok(());
             }
 
-            if is_mentioned || is_reply_to_bot {
+            if is_mentioned || is_reply_to_bot || is_dm_vision {
                 handle_bot_mention(ctx, new_message, data, event, framework).await?;
             }
         }

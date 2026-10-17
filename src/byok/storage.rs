@@ -3,6 +3,7 @@ use super::{
     provider::{self, AiProvider, ProviderError, ProviderResponse},
 };
 use crate::database;
+use crate::vision::attachments::{HARD_MAX_IMAGES, VisionImage};
 use mongodb::{
     IndexModel,
     bson::{Bson, DateTime, Document, doc},
@@ -30,6 +31,10 @@ pub struct Limits {
     pub concurrency: u32,
     pub channels: Vec<u64>,
     pub roles: Vec<u64>,
+    pub vision_enabled: Option<bool>,
+    pub vision_model: Option<String>,
+    pub max_images: usize,
+    pub dm_vision_enabled: bool,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -40,6 +45,10 @@ impl Default for Limits {
             concurrency: 2,
             channels: vec![],
             roles: vec![],
+            vision_enabled: None,
+            vision_model: None,
+            max_images: HARD_MAX_IMAGES,
+            dm_vision_enabled: false,
         }
     }
 }
@@ -67,6 +76,13 @@ impl Limits {
             .clamp(1, 16) as u32;
         result.channels = read_ids(doc, "channels");
         result.roles = read_ids(doc, "roles");
+        result.vision_enabled = doc.get_bool("vision_enabled").ok();
+        result.vision_model = doc.get_str("vision_model").ok().map(str::to_owned);
+        result.max_images = doc
+            .get_i32("max_images")
+            .unwrap_or(HARD_MAX_IMAGES as i32)
+            .clamp(1, HARD_MAX_IMAGES as i32) as usize;
+        result.dm_vision_enabled = doc.get_bool("dm_vision_enabled").unwrap_or(false);
         result
     }
     pub fn to_document(&self) -> Document {
@@ -76,6 +92,10 @@ impl Limits {
             "concurrency": (self.concurrency as i32).clamp(1, 16),
             "channels": self.channels.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
             "roles": self.roles.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "vision_enabled": self.vision_enabled,
+            "vision_model": self.vision_model.as_deref(),
+            "max_images": self.max_images.clamp(1, HARD_MAX_IMAGES) as i32,
+            "dm_vision_enabled": self.dm_vision_enabled,
         }
     }
 }
@@ -88,6 +108,25 @@ fn read_ids(doc: &Document, name: &str) -> Vec<u64> {
         .filter_map(|id| id.parse::<u64>().ok())
         .take(50)
         .collect()
+}
+
+fn allowed_here(limits: &Limits, channel: u64, roles: &[u64]) -> bool {
+    (limits.channels.is_empty() || limits.channels.contains(&channel))
+        && (limits.roles.is_empty() || roles.iter().any(|id| limits.roles.contains(id)))
+}
+
+fn selected_vision_model<'a>(
+    limits: &'a Limits,
+    connection: &'a Connection,
+) -> Result<&'a str, AiError> {
+    if limits.vision_enabled == Some(false) {
+        return Err(AiError::VisionDisabled);
+    }
+    let model = limits.vision_model.as_deref().unwrap_or(&connection.model);
+    if !provider::supports_vision(connection.provider, model) {
+        return Err(AiError::VisionUnsupported);
+    }
+    Ok(model)
 }
 
 fn crossed_daily_notice(before: i32, limit: i32) -> bool {
@@ -114,6 +153,9 @@ pub enum AiError {
     Provider(ProviderError),
     Storage,
     InvalidModel,
+    VisionDisabled,
+    VisionUnsupported,
+    TooManyImages,
 }
 
 pub struct ByokService {
@@ -192,6 +234,16 @@ impl ByokService {
                 "model": model, "sealed": sealed, "generation": hex::encode(generation),
                 "validatedAt": DateTime::now(),
             }).upsert(true).await.map_err(|_| AiError::Storage)?;
+        let mut limits = self.limits(guild).await?;
+        // A replaced key must not inherit permission for owner DM spending.
+        limits.dm_vision_enabled = false;
+        if limits.vision_model.as_ref().is_some_and(|selected| {
+            !models.iter().any(|available| available == selected)
+                || !provider::supports_vision(provider, selected)
+        }) {
+            limits.vision_model = None;
+        }
+        self.save_limits(guild, &limits).await?;
         Ok(())
     }
     pub async fn connection(&self, guild: u64) -> Result<Option<Connection>, AiError> {
@@ -240,6 +292,27 @@ impl ByokService {
             .map_err(|_| AiError::Storage)?;
         Ok(())
     }
+    pub async fn change_vision_model(
+        &self,
+        guild: u64,
+        model: Option<&str>,
+    ) -> Result<(), AiError> {
+        if let Some(model) = model {
+            let credential = self.credential(guild).await?.ok_or(AiError::NotConnected)?;
+            if !provider::supports_vision(credential.connection.provider, model) {
+                return Err(AiError::VisionUnsupported);
+            }
+            let available = self
+                .list_models(credential.connection.provider, &credential.secret)
+                .await?;
+            if !available.iter().any(|id| id == model) {
+                return Err(AiError::InvalidModel);
+            }
+        }
+        let mut limits = self.limits(guild).await?;
+        limits.vision_model = model.map(str::to_owned);
+        self.save_limits(guild, &limits).await
+    }
     pub async fn disconnect(&self, guild: u64) -> Result<(), AiError> {
         database::get_collection(CREDENTIALS)
             .map_err(|_| AiError::Storage)?
@@ -270,6 +343,72 @@ impl ByokService {
             .map_err(|_| AiError::Storage)?;
         Ok(())
     }
+    pub async fn vision_access(
+        &self,
+        guild: u64,
+        channel: u64,
+        roles: &[u64],
+    ) -> Result<usize, AiError> {
+        let limits = self.limits(guild).await?;
+        if !allowed_here(&limits, channel, roles) {
+            return Err(AiError::Forbidden);
+        }
+        let connection = self.connection(guild).await?.ok_or(AiError::NotConnected)?;
+        selected_vision_model(&limits, &connection)?;
+        Ok(limits.max_images)
+    }
+    async fn is_guild_owner(&self, guild: u64, user: u64) -> Result<bool, AiError> {
+        let info = GuildId::new(guild)
+            .to_partial_guild(&self.discord)
+            .await
+            .map_err(|_| AiError::Storage)?;
+        Ok(info.owner_id.get() == user)
+    }
+    pub async fn dm_vision_guilds(&self, user: u64) -> Result<Vec<(u64, String)>, AiError> {
+        use futures::TryStreamExt;
+        let mut cursor = database::get_collection(database::GUILD_SETTINGS)
+            .map_err(|_| AiError::Storage)?
+            .find(doc! {"ai_byok.dm_vision_enabled": true})
+            .projection(doc! {"guild_id": 1})
+            .await
+            .map_err(|_| AiError::Storage)?;
+        let mut result = Vec::new();
+        while let Some(row) = cursor.try_next().await.map_err(|_| AiError::Storage)? {
+            let Some(guild) = row
+                .get_str("guild_id")
+                .ok()
+                .and_then(|id| id.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Ok(info) = GuildId::new(guild).to_partial_guild(&self.discord).await else {
+                continue;
+            };
+            if info.owner_id.get() != user {
+                continue;
+            }
+            let Some(connection) = self.connection(guild).await? else {
+                continue;
+            };
+            let limits = self.limits(guild).await?;
+            if selected_vision_model(&limits, &connection).is_ok() {
+                result.push((guild, info.name));
+            }
+        }
+        Ok(result)
+    }
+    pub async fn dm_vision_access(&self, guild: u64, user: u64) -> Result<usize, AiError> {
+        if !self.is_guild_owner(guild, user).await? {
+            return Err(AiError::Forbidden);
+        }
+        let limits = self.limits(guild).await?;
+        if !limits.dm_vision_enabled {
+            return Err(AiError::VisionDisabled);
+        }
+        let connection = self.connection(guild).await?.ok_or(AiError::NotConnected)?;
+        selected_vision_model(&limits, &connection)?;
+        Ok(limits.max_images)
+    }
     pub async fn ask(
         &self,
         guild: u64,
@@ -278,18 +417,70 @@ impl ByokService {
         roles: &[u64],
         prompt: &str,
     ) -> Result<ProviderResponse, AiError> {
+        self.request(guild, user, channel, roles, prompt, None, false)
+            .await
+    }
+    pub async fn ask_vision(
+        &self,
+        guild: u64,
+        user: u64,
+        channel: u64,
+        roles: &[u64],
+        prompt: &str,
+        images: &[VisionImage],
+    ) -> Result<ProviderResponse, AiError> {
+        if images.is_empty() {
+            return Err(AiError::Forbidden);
+        }
+        self.request(guild, user, channel, roles, prompt, Some(images), false)
+            .await
+    }
+    pub async fn ask_vision_dm(
+        &self,
+        guild: u64,
+        user: u64,
+        channel: u64,
+        prompt: &str,
+        images: &[VisionImage],
+    ) -> Result<ProviderResponse, AiError> {
+        if images.is_empty() {
+            return Err(AiError::Forbidden);
+        }
+        self.request(guild, user, channel, &[], prompt, Some(images), true)
+            .await
+    }
+    async fn request(
+        &self,
+        guild: u64,
+        user: u64,
+        channel: u64,
+        roles: &[u64],
+        prompt: &str,
+        images: Option<&[VisionImage]>,
+        dm_owner: bool,
+    ) -> Result<ProviderResponse, AiError> {
         if prompt.is_empty() || prompt.chars().count() > 2_000 {
             return Err(AiError::Forbidden);
         }
         let limits = self.limits(guild).await?;
-        if (!limits.channels.is_empty() && !limits.channels.contains(&channel))
-            || (!limits.roles.is_empty() && !roles.iter().any(|id| limits.roles.contains(id)))
-        {
+        if dm_owner {
+            if !limits.dm_vision_enabled || !self.is_guild_owner(guild, user).await? {
+                return Err(AiError::Forbidden);
+            }
+        } else if !allowed_here(&limits, channel, roles) {
             return Err(AiError::Forbidden);
         }
         let _active = self.acquire(guild, limits.concurrency)?;
         // No credential is cached; disconnect prevents subsequent new requests.
         let credential = self.credential(guild).await?.ok_or(AiError::NotConnected)?;
+        let model = if let Some(images) = images {
+            if images.len() > limits.max_images {
+                return Err(AiError::TooManyImages);
+            }
+            selected_vision_model(&limits, &credential.connection)?.to_owned()
+        } else {
+            credential.connection.model.clone()
+        };
         let quota_near_limit = self.reserve_quota(guild, user, &limits).await?;
         if quota_near_limit {
             let discord = self.discord.clone();
@@ -320,15 +511,28 @@ impl ByokService {
                 }
             });
         }
-        let response = provider::complete(
-            &self.http,
-            credential.connection.provider,
-            &credential.secret,
-            &credential.connection.model,
-            prompt,
-            limits.output_tokens as u32,
-        )
-        .await;
+        let response = if let Some(images) = images {
+            provider::complete_vision(
+                &self.http,
+                credential.connection.provider,
+                &credential.secret,
+                &model,
+                prompt,
+                limits.output_tokens as u32,
+                images,
+            )
+            .await
+        } else {
+            provider::complete(
+                &self.http,
+                credential.connection.provider,
+                &credential.secret,
+                &model,
+                prompt,
+                limits.output_tokens as u32,
+            )
+            .await
+        };
         let status = match &response {
             Ok(_) => "succeeded",
             Err(ProviderError::RateLimited) => "rate_limited",
@@ -343,10 +547,12 @@ impl ByokService {
             .record_usage(
                 guild,
                 credential.connection.provider,
-                &credential.connection.model,
+                &model,
                 status,
                 input,
                 output,
+                if images.is_some() { "vision" } else { "text" },
+                images.map_or(0, |images| images.len() as i32),
             )
             .await
             .is_err()
@@ -399,16 +605,13 @@ impl ByokService {
         status: &str,
         input: Option<i64>,
         output: Option<i64>,
+        kind: &str,
+        images: i32,
     ) -> Result<(), AiError> {
         let now = DateTime::now();
-        let mut doc = doc! { "guild_id": guild.to_string(), "provider": provider.name(), "model": model,
-        "status": status, "occurredAt": now, "expiresAt": retention_date(now) };
-        if let Some(input) = input {
-            doc.insert("input_tokens", input.max(0));
-        }
-        if let Some(output) = output {
-            doc.insert("output_tokens", output.max(0));
-        }
+        let doc = usage_document(
+            guild, provider, model, status, input, output, kind, images, now,
+        );
         database::get_collection(USAGE)
             .map_err(|_| AiError::Storage)?
             .insert_one(doc)
@@ -423,6 +626,9 @@ impl ByokService {
             doc! {"$group": {"_id": "$status", "requests": {"$sum": 1},
             "input": {"$sum": {"$ifNull": ["$input_tokens", 0]}},
             "output": {"$sum": {"$ifNull": ["$output_tokens", 0]}},
+            "vision_requests": {"$sum": {"$cond": [{"$eq": ["$kind", "vision"]}, 1, 0]}},
+            "vision_successful": {"$sum": {"$cond": [{"$and": [{"$eq": ["$kind", "vision"]}, {"$eq": ["$status", "succeeded"]}]}, 1, 0]}},
+            "images": {"$sum": {"$ifNull": ["$images", 0]}},
             "missing": {"$sum": {"$cond": [{"$and": [{"$eq": ["$status", "succeeded"]}, {"$eq": [{"$type": "$input_tokens"}, "missing"]}]}, 1, 0]}}}},
         ];
         let mut cursor = database::get_collection(USAGE)
@@ -433,24 +639,19 @@ impl ByokService {
         use futures::TryStreamExt;
         let mut summary = UsageSummary::default();
         while let Some(row) = cursor.try_next().await.map_err(|_| AiError::Storage)? {
-            let count = row
-                .get_i32("requests")
-                .map(i64::from)
-                .or_else(|_| row.get_i64("requests"))
-                .unwrap_or(0);
+            let count = sum_count(&row, "requests");
             summary.requests += count;
             if row.get_str("_id").ok() == Some("succeeded") {
                 summary.successful += count;
             } else {
                 summary.failures += count;
             }
-            summary.input_tokens += row.get_i64("input").unwrap_or(0);
-            summary.output_tokens += row.get_i64("output").unwrap_or(0);
-            summary.missing_tokens += row
-                .get_i32("missing")
-                .map(i64::from)
-                .or_else(|_| row.get_i64("missing"))
-                .unwrap_or(0);
+            summary.input_tokens += sum_count(&row, "input");
+            summary.output_tokens += sum_count(&row, "output");
+            summary.vision_requests += sum_count(&row, "vision_requests");
+            summary.vision_successful += sum_count(&row, "vision_successful");
+            summary.images_submitted += sum_count(&row, "images");
+            summary.missing_tokens += sum_count(&row, "missing");
         }
         Ok(summary)
     }
@@ -464,6 +665,42 @@ pub struct UsageSummary {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub missing_tokens: i64,
+    pub vision_requests: i64,
+    pub vision_successful: i64,
+    pub images_submitted: i64,
+}
+
+fn sum_count(row: &Document, key: &str) -> i64 {
+    row.get_i32(key)
+        .map(i64::from)
+        .or_else(|_| row.get_i64(key))
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn usage_document(
+    guild: u64,
+    provider: AiProvider,
+    model: &str,
+    status: &str,
+    input: Option<i64>,
+    output: Option<i64>,
+    kind: &str,
+    images: i32,
+    now: DateTime,
+) -> Document {
+    let mut record = doc! {
+        "guild_id": guild.to_string(), "provider": provider.name(), "model": model,
+        "status": status, "kind": kind, "images": images.max(0),
+        "occurredAt": now, "expiresAt": retention_date(now)
+    };
+    if let Some(input) = input {
+        record.insert("input_tokens", input.max(0));
+    }
+    if let Some(output) = output {
+        record.insert("output_tokens", output.max(0));
+    }
+    record
 }
 
 fn parse_connection(doc: &Document) -> Result<Connection, AiError> {
@@ -549,5 +786,66 @@ mod tests {
         assert!(crossed_daily_notice(8 - 1, 10));
         assert!(!crossed_daily_notice(8, 10));
         assert!(crossed_daily_notice(0, 1));
+    }
+
+    #[test]
+    fn vision_defaults_and_model_gate_are_safe() {
+        let default = Limits::default();
+        assert!(!default.dm_vision_enabled);
+        assert_eq!(default.max_images, 3);
+        let mut connection = Connection {
+            provider: AiProvider::Openai,
+            model: "gpt-3.5-turbo".into(),
+            validated_at: DateTime::now(),
+        };
+        assert!(matches!(
+            selected_vision_model(&default, &connection),
+            Err(AiError::VisionUnsupported)
+        ));
+        connection.model = "gpt-6-astra".into();
+        assert!(selected_vision_model(&default, &connection).is_ok());
+        let mut disabled = default.clone();
+        disabled.vision_enabled = Some(false);
+        assert!(matches!(
+            selected_vision_model(&disabled, &connection),
+            Err(AiError::VisionDisabled)
+        ));
+        disabled.vision_enabled = Some(true);
+        disabled.vision_model = Some("gpt-4o".into());
+        assert_eq!(
+            selected_vision_model(&disabled, &connection).unwrap(),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn usage_record_has_counts_but_no_image_or_prompt_content() {
+        let record = usage_document(
+            1,
+            AiProvider::Openai,
+            "gpt-6-astra",
+            "succeeded",
+            Some(5),
+            Some(2),
+            "vision",
+            2,
+            DateTime::now(),
+        );
+        assert_eq!(record.get_i32("images").unwrap(), 2);
+        assert_eq!(record.get_str("kind").unwrap(), "vision");
+        assert!(!record.contains_key("prompt"));
+        assert!(!record.contains_key("image"));
+        assert!(!record.contains_key("image_data"));
+        assert!(record.get_datetime("expiresAt").is_ok());
+    }
+
+    #[test]
+    fn guild_and_role_restrictions_still_apply_to_vision() {
+        let mut limits = Limits::default();
+        limits.channels.push(4);
+        limits.roles.push(7);
+        assert!(allowed_here(&limits, 4, &[7]));
+        assert!(!allowed_here(&limits, 5, &[7]));
+        assert!(!allowed_here(&limits, 4, &[8]));
     }
 }

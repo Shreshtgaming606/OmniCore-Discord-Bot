@@ -2,7 +2,7 @@ use crate::{
     CustomContext, Error,
     byok::{
         portal,
-        provider::ProviderError,
+        provider::{self, ProviderError},
         storage::{AiError, ByokService},
     },
 };
@@ -28,6 +28,7 @@ use std::sync::Arc;
         "limits",
         "channel",
         "role",
+        "vision",
         "disconnect"
     ),
     subcommand_required,
@@ -63,7 +64,7 @@ async fn respond(ctx: &CustomContext<'_>, text: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn error_message(error: AiError) -> &'static str {
+pub(crate) fn error_message(error: AiError) -> &'static str {
     match error {
         AiError::NotConnected => "No AI provider is connected. The server owner can run /ai setup.",
         AiError::Forbidden => {
@@ -80,6 +81,15 @@ fn error_message(error: AiError) -> &'static str {
         }
         AiError::Provider(_) => "The AI provider could not complete this request.",
         AiError::Storage => "The AI settings service is temporarily unavailable.",
+        AiError::VisionDisabled => {
+            "Image recognition is disabled in this server. The server owner can enable it with /ai vision."
+        }
+        AiError::VisionUnsupported => {
+            "The selected AI model cannot analyze images. The server owner can choose a vision-capable model with /ai vision."
+        }
+        AiError::TooManyImages => {
+            "This server allows fewer images per request. Please select fewer images."
+        }
     }
 }
 
@@ -123,10 +133,34 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         .limits(guild)
         .await
         .map_err(|_| "AI limits unavailable")?;
+    let vision_model = limits.vision_model.as_deref().unwrap_or(&connection.model);
+    let vision_on = limits.vision_enabled != Some(false)
+        && provider::supports_vision(connection.provider, vision_model);
     let embed = CreateEmbed::new()
         .title("OmniCore AI configuration")
         .field("Provider", connection.provider.name(), true)
-        .field("Model", connection.model, true)
+        .field("Model", connection.model.clone(), true)
+        .field(
+            "Vision",
+            format!(
+                "{} ({vision_model})",
+                if vision_on {
+                    "Enabled"
+                } else {
+                    "Unavailable or disabled"
+                }
+            ),
+            false,
+        )
+        .field(
+            "Owner DM vision",
+            if limits.dm_vision_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+            true,
+        )
         .field("Connection", "Connected", true)
         .field("Key", "Stored securely; never displayed", false)
         .field(
@@ -171,7 +205,7 @@ pub async fn settings(ctx: CustomContext<'_>) -> Result<(), Error> {
         .limits(guild)
         .await
         .map_err(|_| "AI settings unavailable")?;
-    respond(&ctx, &format!("AI limits: {} requests per member per day, {} per server per day, {} output tokens per answer, {} concurrent requests. Allowed channels: {:?}. Allowed roles: {:?}. Run /ai setup to manage your provider.", limits.user_daily, limits.guild_daily, limits.output_tokens, limits.concurrency, limits.channels, limits.roles)).await
+    respond(&ctx, &format!("AI limits: {} requests per member per day, {} per server per day, {} output tokens per answer, {} concurrent requests. Allowed channels: {:?}. Allowed roles: {:?}. Vision: {}, up to {} images per request. Owner DM vision: {}. Run /ai setup to manage your provider.", limits.user_daily, limits.guild_daily, limits.output_tokens, limits.concurrency, limits.channels, limits.roles, if limits.vision_enabled == Some(false) { "disabled" } else { "enabled when model supports it" }, limits.max_images, if limits.dm_vision_enabled { "enabled" } else { "disabled" })).await
 }
 
 #[poise::command(slash_command, guild_only, category = "AI")]
@@ -237,8 +271,72 @@ pub async fn usage(ctx: CustomContext<'_>) -> Result<(), Error> {
             summary.input_tokens + summary.output_tokens
         )
     };
-    respond(&ctx, &format!("**OmniCore AI usage — last 30 days**\nRequests: {}\nSuccessful: {}\nFailures/rate limits: {}\nTokens: {}\nCharges are billed by your provider. OmniCore does not calculate an exact bill.",
-        summary.requests, summary.successful, summary.failures, tokens)).await
+    respond(&ctx, &format!("**OmniCore AI usage — last 30 days**\nRequests: {}\nSuccessful: {}\nFailures/rate limits: {}\nImage-analysis requests: {} ({} successful, {} images submitted)\nTokens: {}\nImage processing may incur additional provider charges. OmniCore does not calculate an exact bill.",
+        summary.requests, summary.successful, summary.failures, summary.vision_requests, summary.vision_successful, summary.images_submitted, tokens)).await
+}
+
+#[poise::command(slash_command, guild_only, category = "AI")]
+pub async fn vision(
+    ctx: CustomContext<'_>,
+    #[description = "Enable or disable image recognition"] enabled: Option<bool>,
+    #[description = "Vision model ID, or 'same' to use the chat model"] model: Option<String>,
+    #[description = "Maximum images per request (1–3)"] max_images: Option<i32>,
+    #[description = "Allow the server owner to use this server's key for vision in DMs"] dm_enabled: Option<bool>,
+) -> Result<(), Error> {
+    if !owner(&ctx).await? {
+        return Ok(());
+    }
+    let Some(service) = service(&ctx) else {
+        return respond(&ctx, "Secure AI setup is not configured yet.").await;
+    };
+    let guild = ctx.guild_id().ok_or("Guild required")?.get();
+    let mut current = service
+        .limits(guild)
+        .await
+        .map_err(|_| "AI settings unavailable")?;
+    if let Some(model) = model.as_deref() {
+        let selected = if model.eq_ignore_ascii_case("same") {
+            None
+        } else {
+            Some(model)
+        };
+        match service.change_vision_model(guild, selected).await {
+            Ok(()) => current.vision_model = selected.map(str::to_owned),
+            Err(error) => return respond(&ctx, error_message(error)).await,
+        }
+    }
+    if let Some(max) = max_images {
+        if !(1..=3).contains(&max) {
+            return respond(&ctx, "The image limit must be between 1 and 3.").await;
+        }
+        current.max_images = max as usize;
+    }
+    if let Some(enabled) = enabled {
+        current.vision_enabled = Some(enabled);
+    }
+    if let Some(dm_enabled) = dm_enabled {
+        current.dm_vision_enabled = dm_enabled;
+    }
+    if enabled.is_some() || max_images.is_some() || dm_enabled.is_some() {
+        service
+            .save_limits(guild, &current)
+            .await
+            .map_err(|_| "AI settings update failed")?;
+    }
+    let connection = service
+        .connection(guild)
+        .await
+        .map_err(|_| "AI settings unavailable")?;
+    let model_name = current
+        .vision_model
+        .as_deref()
+        .or_else(|| connection.as_ref().map(|c| c.model.as_str()))
+        .unwrap_or("not connected");
+    let available = connection
+        .as_ref()
+        .is_some_and(|c| provider::supports_vision(c.provider, model_name));
+    respond(&ctx, &format!("Vision: {}. Model: `{model_name}`. Up to {} images per request. Owner DM vision: {}. Image requests count toward the server's existing daily AI limits and may incur additional provider charges.",
+        if current.vision_enabled == Some(false) { "disabled" } else if available { "enabled" } else { "unavailable until a vision-capable model is selected" }, current.max_images, if current.dm_vision_enabled { "enabled" } else { "disabled" })).await
 }
 
 #[poise::command(slash_command, guild_only, category = "AI")]

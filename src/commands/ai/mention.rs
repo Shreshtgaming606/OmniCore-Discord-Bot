@@ -63,6 +63,10 @@ pub(crate) async fn on_mention(
     _event: &serenity::FullEvent,
     framework: poise::FrameworkContext<'_, Data, Error>,
 ) -> Result<(), Error> {
+    let bot_id = ctx.cache.current_user().id;
+    if crate::vision::maybe_handle(ctx, msg, _data, bot_id).await? {
+        return Ok(());
+    }
     // Don't allow DMs
     let Some(guild_id) = msg.guild_id else {
         msg.reply(ctx.http.clone(), "I only work inside servers, not DMs.")
