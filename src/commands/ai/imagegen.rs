@@ -24,7 +24,7 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const QUEUE_WAIT: Duration = Duration::from_secs(120);
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
 const QUEUE_CAPACITY: usize = 4;
-const MIN_HOST_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MIN_HOST_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 static QUEUE_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(QUEUE_CAPACITY)));
@@ -184,7 +184,7 @@ impl GenerateError {
                 "I could not check the Mac's free disk space, so image generation is paused."
             }
             Self::HostDiskLow => {
-                "The Mac needs at least 8 GB of free internal disk space for safe image generation."
+                "The Mac needs at least 10 GiB of free internal disk space for safe image generation."
             }
             Self::ModelMissing => "The FLUX.2 Klein 4B model is missing from local Ollama.",
             Self::UnsupportedRuntime => {
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn host_disk_guard_requires_eight_gibibytes() {
+    fn host_disk_guard_requires_ten_gibibytes() {
         assert!(ensure_host_space(MIN_HOST_FREE_BYTES - 1).is_err());
         assert!(ensure_host_space(MIN_HOST_FREE_BYTES).is_ok());
         #[cfg(unix)]

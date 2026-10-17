@@ -12,7 +12,7 @@ The bot validates Ollama's base64 response as a PNG, limits encoded and decoded 
 
 Each request generates a 512×512 PNG and asks Ollama to unload the image model when generation finishes (`keep_alive: 0`) to reduce memory pressure on this 16 GB Mac. Keep several gigabytes of internal disk free for macOS swap. A kernel panic on October 17, 2026 reported a watchdog timeout, a full compressor segment limit, and low swap space while the internal disk had less than 500 MB available; image generation should not be run while the disk is that full.
 
-On this Mac, the bot container has an empty internal-drive directory mounted read-only at `/host-disk-check`, and `OMNICORE_IMAGEGEN_HOST_DISK_PATH=/host-disk-check`. Before sending a job to Ollama, the Rust command uses `statvfs` on that mount and publicly pauses the request if the Mac has less than 8 GiB available or the check fails. The mount exposes no host files. Other deployments can configure their own check path; without it, this optional guard is disabled.
+On this Mac, the bot container has an empty internal-drive directory mounted read-only at `/host-disk-check`, and `OMNICORE_IMAGEGEN_HOST_DISK_PATH=/host-disk-check`. Before sending a job to Ollama, the Rust command uses `statvfs` on that mount and publicly pauses the request if the Mac has less than 10 GiB available or the check fails. The mount exposes no host files. Other deployments can configure their own check path; without it, this optional guard is disabled.
 
 Local setup checks:
 
