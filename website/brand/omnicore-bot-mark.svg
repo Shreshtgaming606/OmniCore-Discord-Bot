@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">OmniCore geometric core mark</title>
+  <defs>
+    <linearGradient id="core" x1="30" y1="38" x2="223" y2="216" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#65e7ff"/>
+      <stop offset=".52" stop-color="#549ef8"/>
+      <stop offset="1" stop-color="#a47cf7"/>
+    </linearGradient>
+    <linearGradient id="center" x1="95" y1="90" x2="158" y2="166" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c9f8ff"/>
+      <stop offset="1" stop-color="#7eafff"/>
+    </linearGradient>
+  </defs>
+  <path d="M128 21 219 73v110l-91 52-91-52V73l91-52Zm0 37L69 91v74l59 34 59-34V91l-59-33Z" fill="url(#core)" fill-rule="evenodd"/>
+  <path d="m128 87 35 20v42l-35 20-35-20v-42l35-20Z" fill="url(#center)"/>
+  <path d="m128 87 35 20-35 20-35-20 35-20Z" fill="#d7fbff"/>
+  <path d="m128 127 35-20v42l-35 20v-42Z" fill="#67b9fd"/>
+  <path d="m128 127-35-20v42l35 20v-42Z" fill="#8294f5"/>
+</svg>

@@ -5,7 +5,6 @@ use poise::serenity_prelude::{
     Colour, CreateAllowedMentions, CreateEmbed, Mentionable, Role, Timestamp,
 };
 
-/// Compares two roles and reports which one has the higher position.
 #[poise::command(
     slash_command,
     prefix_command,

@@ -1,25 +1,17 @@
 use dotenvy::dotenv;
+use once_cell::sync::OnceCell;
 use std::env;
-use tokio::sync::OnceCell;
 
-/// Discord bot token loaded from the environment.
-pub(crate) static DISCORD_TOKEN: OnceCell<String> = OnceCell::const_new();
-/// MongoDB connection string used by the persistence layer.
-pub(crate) static MONGO_URI: OnceCell<String> = OnceCell::const_new();
-/// Base URL for the Ollama server.
-pub(crate) static OLLAMA_BASE_URL: OnceCell<String> = OnceCell::const_new();
-/// Default Ollama model used for AI responses.
-pub(crate) static OLLAMA_MODEL: OnceCell<String> = OnceCell::const_new();
-/// Discord user IDs that are allowed to use owner-only commands.
-pub(crate) static BOT_OWNERS: OnceCell<Vec<u64>> = OnceCell::const_new();
-/// First shard index to start from when connecting to Discord.
-pub(crate) static START_SHARD: OnceCell<u32> = OnceCell::const_new();
-/// Exclusive shard end index used for the startup shard range.
-pub(crate) static END_SHARD: OnceCell<u32> = OnceCell::const_new();
-/// Total number of shards the bot should expect.
-pub(crate) static TOTAL_SHARDS: OnceCell<u32> = OnceCell::const_new();
+pub(crate) static DISCORD_TOKEN: OnceCell<String> = OnceCell::new();
+pub(crate) static MONGO_URI: OnceCell<String> = OnceCell::new();
+pub(crate) static OLLAMA_BASE_URL: OnceCell<String> = OnceCell::new();
+pub(crate) static OLLAMA_MODEL: OnceCell<String> = OnceCell::new();
+pub(crate) static BOT_OWNERS: OnceCell<Vec<u64>> = OnceCell::new();
+pub(crate) static DEVELOPER_IDS: OnceCell<[u64; 2]> = OnceCell::new();
+pub(crate) static START_SHARD: OnceCell<u32> = OnceCell::new();
+pub(crate) static END_SHARD: OnceCell<u32> = OnceCell::new();
+pub(crate) static TOTAL_SHARDS: OnceCell<u32> = OnceCell::new();
 
-/// Loads environment-backed configuration and validates the required settings.
 pub(crate) fn init_config() {
     dotenv().ok();
 
@@ -42,11 +34,27 @@ pub(crate) fn init_config() {
     }
 
     let bot_owners = env::var("BOT_OWNERS")
-        .unwrap_or("1157083515486220429,1109540816013234256".to_string()) // First is wyra.net (GitHub: I4LYT) and second is Shreshtgaming606 (GitHub: shreshtgaming606).
+        .unwrap_or("1157083515486220429,1109540816013234256".to_string()) // First is l1fe_wyra and second is Shreshtgaming606.
         .split(',')
         .map(|s| s.trim().parse::<u64>().expect("Invalid BOT_OWNERS value"))
         .collect::<Vec<u64>>();
     BOT_OWNERS.set(bot_owners).unwrap();
+
+    // These are intentionally separate from legacy BOT_OWNERS. A guild owner or a
+    // historical bot operator must never be substituted for either developer.
+    let developer_ids = ["OMNICORE_OWNER_1_ID", "OMNICORE_OWNER_2_ID"].map(|name| {
+        let value = env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+        let id = value
+            .parse::<u64>()
+            .expect("Invalid developer Discord user ID");
+        assert!(id > 0, "Developer Discord user IDs must be nonzero");
+        id
+    });
+    assert_ne!(
+        developer_ids[0], developer_ids[1],
+        "Developer IDs must differ"
+    );
+    DEVELOPER_IDS.set(developer_ids).unwrap();
 
     let start_shard = env::var("START_SHARD")
         .unwrap_or("0".to_string())

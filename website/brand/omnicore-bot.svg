@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">OmniCore Discord Bot avatar</title>
+  <defs>
+    <linearGradient id="core" x1="210" y1="210" x2="825" y2="830" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#65e7ff"/>
+      <stop offset=".52" stop-color="#549ef8"/>
+      <stop offset="1" stop-color="#a47cf7"/>
+    </linearGradient>
+    <linearGradient id="center" x1="410" y1="380" x2="624" y2="664" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#c9f8ff"/>
+      <stop offset="1" stop-color="#7eafff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="#0b1224"/>
+  <path d="m512 176 304 175v322L512 848 208 673V351l304-175Zm0 124L316 413v198l196 113 196-113V413L512 300Z" fill="url(#core)" fill-rule="evenodd"/>
+  <path d="m512 379 117 67v132l-117 67-117-67V446l117-67Z" fill="url(#center)"/>
+  <path d="m512 379 117 67-117 67-117-67 117-67Z" fill="#d7fbff"/>
+  <path d="m512 513 117-67v132l-117 67V513Z" fill="#67b9fd"/>
+  <path d="m512 513-117-67v132l117 67V513Z" fill="#8294f5"/>
+</svg>

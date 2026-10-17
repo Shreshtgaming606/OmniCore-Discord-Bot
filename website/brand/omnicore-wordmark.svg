@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 850 180" role="img" aria-labelledby="title">
+  <title id="title">OmniCore wordmark</title>
+  <defs>
+    <linearGradient id="core" x1="13" y1="25" x2="169" y2="158" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#65e7ff"/>
+      <stop offset=".52" stop-color="#549ef8"/>
+      <stop offset="1" stop-color="#a47cf7"/>
+    </linearGradient>
+  </defs>
+  <path d="m90 8 76 44v88l-76 44-76-44V52L90 8Zm0 31L40 68v56l50 29 50-29V68L90 39Z" fill="url(#core)" fill-rule="evenodd"/>
+  <path d="m90 65 25 14v27l-25 14-25-14V79l25-14Z" fill="#a8ecff"/>
+  <text x="200" y="123" fill="#ecf4ff" font-family="Manrope, Arial, sans-serif" font-size="84" font-weight="800" letter-spacing="-4">OmniCore</text>
+</svg>

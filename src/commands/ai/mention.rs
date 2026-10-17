@@ -1,13 +1,12 @@
 use super::SYSTEM_PROMPT;
-use super::tools::{timeout::Timeout, wikipedia::Wikipedia, wikipedia_search::WikipediaSearch};
+use super::tools::{wikipedia::Wikipedia, wikipedia_search::WikipediaSearch};
 use crate::OLLAMA;
 use crate::config::{BOT_OWNERS, OLLAMA_MODEL};
-use crate::database::get_collection;
+use crate::database::{self, get_collection};
 use crate::{Data, Error};
 use chrono::Utc;
 use mongodb::bson::Bson;
 use mongodb::bson::doc;
-use mongodb::options::UpdateOptions;
 use ollama_rs::generation::chat::{ChatMessage, MessageRole, request::ChatMessageRequest};
 use ollama_rs::generation::tools::Tool;
 use ollama_rs::models::ModelOptions;
@@ -71,6 +70,17 @@ pub(crate) async fn on_mention(
         return Ok(());
     };
 
+    if let Some(service) = _data.byok.as_ref() {
+        if service
+            .connection(guild_id.get())
+            .await
+            .map_err(|_| "AI connection unavailable")?
+            .is_some()
+        {
+            return super::byok_commands::reply_to_mention(ctx, msg, service).await;
+        }
+    }
+
     let owners = BOT_OWNERS
         .get()
         .unwrap()
@@ -92,7 +102,7 @@ pub(crate) async fn on_mention(
         return Ok(());
     }
 
-    log::info!("Mentioned in guild {}", guild_id);
+    log::info!("AI mention received");
 
     let typing = poise::serenity_prelude::Typing::start(ctx.http.clone(), msg.channel_id);
 
@@ -142,30 +152,26 @@ pub(crate) async fn on_mention(
     }
     prompt.insert("message", Bson::Document(message_doc_content));
 
-    let messages_col = get_collection("messages").expect("Failed to load messages collection");
+    database::insert_ai_turn(
+        &guild_id.to_string(),
+        Some(&msg.author.id.to_string()),
+        &msg.author.id.to_string(),
+        prompt,
+    )
+    .await?;
 
-    // Atomically ensure the guild doc exists and push the new message in one round trip.
-    // $setOnInsert only applies when the upsert creates a new doc, so no race with concurrent
-    // mentions in a guild that has no doc yet.
-    messages_col
-        .update_one(
-            doc! { "guild_id": guild_id.to_string() },
-            doc! {
-                "$setOnInsert": { "guild_id": guild_id.to_string() },
-                "$push": { "messages": prompt.clone() },
-            },
-        )
-        .with_options(UpdateOptions::builder().upsert(true).build())
-        .await?;
-
-    // Fetch back only the last HISTORY_WINDOW messages via $slice, keeping context bounded.
-    let messages_doc = messages_col
-        .find_one(doc! { "guild_id": guild_id.to_string() })
-        .projection(doc! { "messages": { "$slice": -HISTORY_WINDOW } })
-        .await?
-        .ok_or("Guild message document missing immediately after upsert")?;
-
-    let mut messages = messages_doc.get_array("messages")?.clone();
+    // During the reviewed legacy migration, combine recent embedded history with new TTL turns.
+    // New writes go only to ai_turns; old turns never acquire a new retention period here.
+    let mut messages: Vec<Bson> =
+        database::recent_legacy_turns(&guild_id.to_string(), HISTORY_WINDOW)
+            .await?
+            .into_iter()
+            .chain(database::recent_ai_turns(&guild_id.to_string(), HISTORY_WINDOW).await?)
+            .map(Bson::Document)
+            .collect();
+    if messages.len() > HISTORY_WINDOW as usize {
+        messages.drain(..messages.len() - HISTORY_WINDOW as usize);
+    }
 
     // Changeable with /change_prompt
     let custom_system_prompt = guild_settings.get_str("ai_prompt").unwrap_or_default();
@@ -218,11 +224,18 @@ pub(crate) async fn on_mention(
         })
         .collect::<Result<Vec<ChatMessage>, String>>()?;
 
-    let model = OLLAMA_MODEL.get().unwrap().clone();
-    let ollama = OLLAMA.get().unwrap().clone();
+    let model = OLLAMA_MODEL
+        .get()
+        .ok_or("Ollama model not configured")?
+        .clone();
+    let Some(ollama) = OLLAMA.get().cloned() else {
+        typing.stop();
+        msg.reply(ctx.http.clone(), "AI replies are temporarily unavailable.")
+            .await?;
+        return Ok(());
+    };
 
     let mut wikipedia = Wikipedia::new();
-    let mut timeout = Timeout::new(ctx.clone(), msg.clone(), guild_id.clone());
     let mut wikipedia_search = WikipediaSearch::new();
 
     // Tool-call loop: send the request, and if the model asks for a tool, run it, append the
@@ -241,8 +254,7 @@ pub(crate) async fn on_mention(
                     .extra("think", Value::Bool(false)),
             )
             .add_tool(Wikipedia::new())
-            .add_tool(WikipediaSearch::new())
-            .add_tool(Timeout::new(ctx.clone(), msg.clone(), guild_id.clone()));
+            .add_tool(WikipediaSearch::new());
 
         let res = ollama
             .send_chat_messages_with_history(&mut chat_history, request)
@@ -252,7 +264,7 @@ pub(crate) async fn on_mention(
             Ok(res) => res,
             Err(e) => {
                 typing.stop();
-                log::error!("Ollama request failed for guild {}: {}", guild_id, e);
+                log::error!("Ollama request failed: {}", e);
                 msg.reply(
                     ctx.http.clone(),
                     "Sorry, I couldn't process that — something went wrong on my end.",
@@ -283,14 +295,6 @@ pub(crate) async fn on_mention(
                         .unwrap_or_else(|e| format!("Wikipedia lookup failed: {}", e)),
                     Err(e) => format!("Invalid arguments for wikipedia: {}", e),
                 }
-            } else if call.function.name == Timeout::name() {
-                match serde_json::from_value(call.function.arguments.clone()) {
-                    Ok(params) => timeout
-                        .call(params)
-                        .await
-                        .unwrap_or_else(|e| format!("Timeout failed: {}", e)),
-                    Err(e) => format!("Invalid arguments for timeout: {}", e),
-                }
             } else if call.function.name == WikipediaSearch::name() {
                 match serde_json::from_value(call.function.arguments.clone()) {
                     Ok(params) => wikipedia_search
@@ -314,14 +318,15 @@ pub(crate) async fn on_mention(
                 "guild": { "owner": { "id": guild_owner_id.clone() } },
                 "role": "TOOL".to_string()
             };
-            if let Err(e) = messages_col
-                .update_one(
-                    doc! { "guild_id": guild_id.to_string() },
-                    doc! { "$push": { "messages": tool_doc.clone() } },
-                )
-                .await
+            if let Err(e) = database::insert_ai_turn(
+                &guild_id.to_string(),
+                None,
+                &msg.author.id.to_string(),
+                tool_doc.clone(),
+            )
+            .await
             {
-                log::error!("Failed to persist tool turn for guild {}: {}", guild_id, e);
+                log::error!("Failed to persist tool turn: {}", e);
             }
 
             next_turns.push(ChatMessage::tool(tool_doc.to_string()));
@@ -337,10 +342,7 @@ pub(crate) async fn on_mention(
     let res = match final_res {
         Some(res) => res,
         None => {
-            log::error!(
-                "Tool loop ended without a final response for guild {}",
-                guild_id
-            );
+            log::error!("Tool loop ended without a final response");
             msg.reply(
                 ctx.http.clone(),
                 "Sorry, I couldn't process that - something went wrong on my end.",
@@ -398,21 +400,18 @@ pub(crate) async fn on_mention(
         }
     };
 
-    if let Err(e) = messages_col
-        .update_one(
-            doc! { "guild_id": guild_id.to_string() },
-            doc! { "$push": { "messages": response_doc } },
-        )
-        .await
+    if let Err(e) = database::insert_ai_turn(
+        &guild_id.to_string(),
+        None,
+        &msg.author.id.to_string(),
+        response_doc,
+    )
+    .await
     {
         // Don't fail as it won't do anything, but still log the error.
-        log::error!(
-            "Failed to persist assistant response for guild {}: {}",
-            guild_id,
-            e
-        );
+        log::error!("Failed to persist assistant response: {}", e);
     }
 
-    log::info!("Finished mention in guild {}", guild_id);
+    log::info!("Finished AI mention");
     Ok(())
 }

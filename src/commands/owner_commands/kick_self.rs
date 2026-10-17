@@ -1,6 +1,6 @@
 use crate::commands::build_message_reply;
 use crate::commands::owner_commands::autocomplete_guild;
-use crate::{CustomContext, Error};
+use crate::{CustomContext, Error, database};
 use mongodb::bson::doc;
 use poise::CreateReply;
 use poise::serenity_prelude::{
@@ -22,7 +22,7 @@ pub async fn kick_self(
     #[autocomplete = "autocomplete_guild"]
     guild: String,
 ) -> Result<(), Error> {
-    //! Kicks/leaves the bot from the specified server.
+    //! Kicks the bot from the specified server.
     let typing = poise::serenity_prelude::Typing::start(
         ctx.serenity_context().http.clone(),
         ctx.channel_id(),
@@ -153,6 +153,7 @@ pub async fn kick_self(
     // Kick the bot from the guild
     match guild_id.leave(&ctx.http()).await {
         Ok(_) => {
+            database::delete_guild_data(&guild_id.to_string()).await?;
             sent_msg
                 .edit(
                     ctx,

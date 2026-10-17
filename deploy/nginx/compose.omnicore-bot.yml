@@ -1,0 +1,20 @@
+ # Use with the existing Compose file as an override:
+ # docker compose -f docker-compose.yml -f compose.omnicore-bot.yml up -d omnicore-bot-site
+ # It does not replace the existing nginx or omnicore services.
+services:
+  omnicore-bot-site:
+    image: nginx:stable
+    container_name: omnicore-bot-site
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8091:8091"
+    volumes:
+      - ./html/omnicore-bot:/usr/share/nginx/html:ro
+      - ./conf/sites-available/omnicore-bot.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - default
+      - omnicore-network
+
+networks:
+  omnicore-network:
+    external: true

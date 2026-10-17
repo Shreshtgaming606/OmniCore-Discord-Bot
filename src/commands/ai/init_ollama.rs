@@ -10,27 +10,34 @@ pub(crate) async fn init_ollama() {
     let ollama_base_url = OLLAMA_BASE_URL.get().unwrap();
     let response = client.get(&*ollama_base_url).send().await;
     if let Err(e) = response {
-        panic!(
-            "Failed to ping Ollama server (check if Ollama is running and public): {}",
-            e
+        log::warn!(
+            "Ollama is unavailable at startup; AI chat and AutoMod classification will fail safely: {e}"
         );
+        return;
     }
 
     // Create the Ollama client
-    let ollama = Ollama::try_new(ollama_base_url)
-        .expect("Failed to initialize Ollama client, check your OLLAMA_BASE_URL");
-    OLLAMA.set(ollama.clone()).unwrap();
+    let ollama = match Ollama::try_new(ollama_base_url) {
+        Ok(client) => client,
+        Err(error) => {
+            log::warn!("Unable to initialize Ollama: {error}");
+            return;
+        }
+    };
 
     // List models and validate that the chosen model actually exists
     let ollama_model = OLLAMA_MODEL.get().unwrap();
 
-    let models = ollama
-        .list_local_models()
-        .await
-        .expect("Failed to list Ollama models")
-        .iter()
-        .map(|m| m.name.clone())
-        .collect::<Vec<String>>();
+    let models = match ollama.list_local_models().await {
+        Ok(models) => models,
+        Err(error) => {
+            log::warn!("Unable to list Ollama models: {error}");
+            return;
+        }
+    }
+    .iter()
+    .map(|m| m.name.clone())
+    .collect::<Vec<String>>();
 
     if !models.contains(&ollama_model) {
         log::error!(
@@ -38,8 +45,9 @@ pub(crate) async fn init_ollama() {
             ollama_model
         );
         log::error!("Available models: {:?}", models);
-        std::process::exit(78);
+        return;
     }
 
+    let _ = OLLAMA.set(ollama);
     log::info!("Ollama model `{}` is valid", ollama_model);
 }

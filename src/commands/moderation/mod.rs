@@ -1,3 +1,4 @@
+pub(crate) mod automod;
 pub(crate) mod ban;
 pub(crate) mod kick;
 pub(crate) mod lock;

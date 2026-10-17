@@ -1,7 +1,8 @@
+// just a subcommand thingy
+
 use super::allroles::roles_all;
 use crate::{CustomContext, Error};
 
-/// Parent command for role-related utilities; actual work is done by subcommands.
 #[poise::command(
     slash_command,
     prefix_command,

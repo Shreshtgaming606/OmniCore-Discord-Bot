@@ -24,5 +24,7 @@ rustc-ice-*.txt
 .idea/
 
 .env
+.env.*
+!.env.example
 
 /log

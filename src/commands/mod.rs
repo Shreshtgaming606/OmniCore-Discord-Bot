@@ -1,10 +1,5 @@
-//! Shared command modules and helper utilities.
-//!
-//! This module groups the bot's command categories and exposes small helpers
-//! used across multiple commands, such as duration parsing and role
-//! comparison.
-
 pub(crate) mod ai;
+pub(crate) mod analytics;
 pub(crate) mod basic_utils;
 pub(crate) mod moderation;
 pub(crate) mod owner_commands;
@@ -18,7 +13,6 @@ use poise::{
 use regex::Regex;
 use std::time::Duration;
 
-/// Builds a standard embed reply used by several commands.
 fn build_message_reply(title: &str, desc: &str, color: Colour, mention: bool) -> CreateReply {
     let res = CreateReply::default()
         .embed(
@@ -37,7 +31,6 @@ fn build_message_reply(title: &str, desc: &str, color: Colour, mention: bool) ->
     return res;
 }
 
-/// Errors returned by [`parse_duration`].
 #[derive(Debug)]
 pub enum DurationParseError {
     Empty,
@@ -45,7 +38,6 @@ pub enum DurationParseError {
     Overflow,
 }
 
-/// Parses human-readable duration strings like `2h30m` or `1 week`.
 pub fn parse_duration(input: &str) -> Result<Duration, DurationParseError> {
     let input = input.trim().to_lowercase();
     if input.is_empty() {
@@ -88,7 +80,6 @@ pub fn parse_duration(input: &str) -> Result<Duration, DurationParseError> {
     Ok(Duration::from_secs(total_secs))
 }
 
-/// Relative ordering between two Discord roles.
 #[derive(Debug)]
 pub enum RoleCompareResult {
     Greater,
@@ -96,7 +87,7 @@ pub enum RoleCompareResult {
     Less,
 }
 
-/// Compares two roles using Discord's role position ordering.
+// Helper function to compare two roles by their position
 pub fn compare_roles(role1: &Role, role2: &Role) -> RoleCompareResult {
     let role1_position = role1.position;
     let role2_position = role2.position;
@@ -108,7 +99,6 @@ pub fn compare_roles(role1: &Role, role2: &Role) -> RoleCompareResult {
     }
 }
 
-/// Finds the highest-positioned role currently assigned to a guild member.
 pub fn get_highest_role_from_member(member: &Member, ctx: CustomContext<'_>) -> Option<RoleId> {
     let mut highest_role_pos = 0;
     let mut highest_role_id = None;

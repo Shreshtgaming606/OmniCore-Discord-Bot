@@ -1,6 +1,5 @@
 use super::super::build_message_reply;
-use crate::{CustomContext, Error, database::get_collection};
-use mongodb::bson::doc;
+use crate::{CustomContext, Error, database};
 use poise::serenity_prelude::Colour;
 
 #[poise::command(
@@ -15,10 +14,7 @@ use poise::serenity_prelude::Colour;
 )]
 pub(crate) async fn delete_memory(ctx: CustomContext<'_>) -> Result<(), Error> {
     //! Deletes all memories from the bot
-    let messages_col = get_collection("messages").expect("Failed to load messages collection");
-    let _ = messages_col
-        .delete_one(doc! {"guild_id": ctx.guild_id().unwrap().to_string()})
-        .await;
+    database::delete_guild_ai_history(&ctx.guild_id().unwrap().to_string()).await?;
 
     ctx.send(build_message_reply(
         "Deleted Memories",

@@ -1,0 +1,7 @@
+.env
+.env.runtime
+log/
+target/
+.git/
+.idea/
+.DS_Store

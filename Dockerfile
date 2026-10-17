@@ -1,4 +1,4 @@
-FROM rust:1.97-slim-bookworm AS builder
+FROM rust:1.98.1-slim-bookworm AS builder
 
 WORKDIR /usr/src/app
 
@@ -34,5 +34,6 @@ RUN apt-get update && \
 WORKDIR /usr/local/bin
 
 COPY --from=builder /usr/src/app/target/release/omnicore_bot .
+COPY --from=builder /usr/src/app/target/release/retention_audit /usr/src/app/target/release/retention_migrate ./
 
 CMD ["./omnicore_bot"]

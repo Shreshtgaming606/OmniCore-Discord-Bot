@@ -1,20 +1,16 @@
-//! OmniCore Discord Bot
-//!
-//! This binary wires together configuration loading, MongoDB, Ollama, command
-//! registration, and Discord event handling. The startup flow is:
-//! 1. initialize logging and environment-backed config
-//! 2. connect to MongoDB and Ollama
-//! 3. register all slash/prefix commands globally
-//! 4. start the Discord shard range and listen for shutdown signals
-
+mod automod;
+mod byok;
 mod commands;
 mod config;
 mod database;
 mod logging;
+mod moderation_events;
+mod retention;
 
 use crate::commands::ai::init_ollama::init_ollama;
 use mongodb::bson::doc;
 use ollama_rs::Ollama;
+use once_cell::sync::OnceCell;
 use poise::serenity_prelude::Permissions;
 use poise::{
     Command, CreateReply, FrameworkError,
@@ -30,37 +26,31 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::signal;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::OnceCell;
 
-/// Shared runtime state passed into poise command handlers.
-#[derive(Clone, Debug, Copy)]
-struct Data {}
+#[derive(Clone)]
+struct Data {
+    automod: std::sync::Arc<automod::AutoModService>,
+    byok: Option<std::sync::Arc<byok::storage::ByokService>>,
+}
+impl std::fmt::Debug for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Data { automod: configured, byok: redacted }")
+    }
+}
 type Error = Box<dyn std::error::Error + Send + Sync>;
-/// Convenience alias for the bot's command context type.
 type CustomContext<'a> = poise::Context<'a, Data, Error>;
-/// Discord event handler used for presence setup and mention routing.
 struct Handler;
 
-/// Timestamp recorded when the process starts. (used in /info command)
-static START_TIME: OnceCell<chrono::DateTime<chrono::Utc>> = OnceCell::const_new();
-/// Lazily initialized Ollama client shared across mention handlers.
-static OLLAMA: OnceCell<Ollama> = OnceCell::const_new();
+static START_TIME: OnceCell<chrono::DateTime<chrono::Utc>> = OnceCell::new();
+static OLLAMA: OnceCell<Ollama> = OnceCell::new();
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let guilds = ready
-            .guilds
-            .to_vec()
-            .iter()
-            .map(|g| g.id.to_string())
-            .collect::<Vec<String>>()
-            .join(", ");
         log::info!(
-            "Shard {} is connected to {} in guilds: {:#?} ",
+            "Shard {} connected in {} guilds",
             ready.shard.unwrap().id,
-            ready.user.name,
-            guilds
+            ready.guilds.len()
         );
         ctx.shard.set_presence(
             Some(ActivityData::custom("/help | OmniCore Discord Bot")),
@@ -69,18 +59,6 @@ impl EventHandler for Handler {
     }
 }
 
-/// Returns the best available display name for the current command author.
-async fn get_user_name(ctx: &CustomContext<'_>) -> String {
-    if ctx.guild_id().is_none() {
-        return ctx.author().name.clone();
-    }
-    ctx.author_member().await.map_or_else(
-        || ctx.author().name.clone(),
-        |member| member.user.name.clone(),
-    )
-}
-
-/// Returns a human-readable guild name, or a DM placeholder when applicable.
 async fn get_guild_name(ctx: &CustomContext<'_>) -> String {
     if ctx.guild_id().is_none() {
         return "DMs (not an actual server)".to_string();
@@ -88,16 +66,14 @@ async fn get_guild_name(ctx: &CustomContext<'_>) -> String {
     ctx.guild().unwrap().name.clone()
 }
 
-/// Returns the guild owner ID for guild commands, or an invalid value in DMs.
 #[allow(dead_code)]
 async fn get_guild_owner_id(ctx: &CustomContext<'_>) -> serenity::UserId {
     if ctx.guild_id().is_none() {
-        return serenity::UserId::new(1); // Discord doesn't have a user id of 1, and 0 isn't allowed in serenity
+        return serenity::UserId::new(1); // Invalid, so nothing can point to it.
     }
     ctx.guild().unwrap().owner_id
 }
 
-/// Routes Discord message events that mention or reply to the bot.
 async fn event_handler(
     ctx: &Context,
     event: &serenity::FullEvent,
@@ -105,6 +81,15 @@ async fn event_handler(
     data: &Data,
 ) -> Result<(), Error> {
     match event {
+        serenity::FullEvent::GuildCreate { guild, .. } => {
+            setup_guild(guild.id).await;
+        }
+        serenity::FullEvent::GuildDelete { incomplete, .. } => {
+            if !incomplete.unavailable {
+                database::delete_guild_data(&incomplete.id.to_string()).await?;
+                log::info!("Removed stored data for a departed guild");
+            }
+        }
         serenity::FullEvent::Message { new_message } => {
             // ignore bots (including ourselves) to avoid loops
             if new_message.author.bot {
@@ -116,14 +101,20 @@ async fn event_handler(
                 .expect("Failed to access cache")
                 .current_user()
                 .id;
-
             let is_mentioned = new_message.mentions.iter().any(|u| u.id == bot_id);
+            let is_reply_to_bot = new_message
+                .referenced_message
+                .as_ref()
+                .is_some_and(|referenced| referenced.author.id == bot_id);
+            if (is_mentioned || is_reply_to_bot)
+                && commands::ai::owner_mute::maybe_handle(ctx, new_message, bot_id).await
+            {
+                return Ok(());
+            }
 
-            let is_reply_to_bot = if let Some(referenced) = &new_message.referenced_message {
-                referenced.author.id == bot_id
-            } else {
-                false
-            };
+            if data.automod.submit(ctx, new_message).await {
+                return Ok(());
+            }
 
             if is_mentioned || is_reply_to_bot {
                 handle_bot_mention(ctx, new_message, data, event, framework).await?;
@@ -134,7 +125,6 @@ async fn event_handler(
     Ok(())
 }
 
-/// Delegates mention handling to the AI integration layer.
 async fn handle_bot_mention(
     ctx: &Context,
     msg: &serenity::Message,
@@ -147,7 +137,6 @@ async fn handle_bot_mention(
     Ok(())
 }
 
-/// Bootstraps the bot, registers commands, and starts shard processing.
 #[tokio::main]
 async fn main() {
     START_TIME
@@ -166,6 +155,12 @@ async fn main() {
     let _ = database::ensure_indexes()
         .await
         .expect("Failed to ensure indexes");
+    moderation_events::ensure_indexes()
+        .await
+        .expect("Failed to ensure moderation event indexes");
+    byok::storage::ensure_indexes()
+        .await
+        .expect("Failed to ensure BYOK usage indexes");
 
     let mut owners: HashSet<serenity::UserId> = HashSet::from([]);
 
@@ -174,12 +169,13 @@ async fn main() {
 
     let cmds: Vec<Command<Data, Box<dyn std::error::Error + Send + Sync>>> = vec![
         commands::basic_utils::ping::ping(),
-        commands::basic_utils::prefix::change_prefix(),
+        commands::basic_utils::prefix::set_prefix(),
         commands::basic_utils::info::info(),
         commands::basic_utils::help::help(),
         commands::basic_utils::compare_roles::compare_roles_f(),
         commands::basic_utils::role::role(),
         commands::basic_utils::highest_role_from_member::highest_role_from_member(),
+        commands::basic_utils::allroles::roles_all(),
         commands::basic_utils::server_info::serverinfo(),
         commands::moderation::kick::kick(),
         commands::moderation::ban::ban(),
@@ -188,48 +184,53 @@ async fn main() {
         commands::moderation::unlock::unlock(),
         commands::moderation::purge::purge(),
         commands::moderation::time::time(),
+        commands::moderation::automod::automod(),
+        commands::analytics::analytics(),
+        commands::ai::byok_commands::ai(),
+        commands::ai::byok_commands::ask(),
         commands::moderation::untime::untime(),
         commands::ai::approve::approve(),
         commands::ai::disapprove::disapprove(),
         commands::ai::delete_memory::delete_memory(),
+        commands::ai::delete_my_data::delete_my_data(),
         commands::ai::change_prompt::change_prompt(),
         commands::ai::get_prompt::get_prompt(),
-        commands::ai::delete_prompt::delete_prompt(),
+        commands::ai::remove_prompt::remove_prompt(),
         commands::owner_commands::all_servers::all_servers(),
         commands::owner_commands::create_invite::create_invite(),
         commands::owner_commands::kick_self::kick_self(),
     ];
 
     let token = config::DISCORD_TOKEN.get().unwrap();
-    // # Warning:
-    // Bot **WILL** fail to start if the application related to the token doesn't have these intents enabled.
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::privileged()
-        | GatewayIntents::non_privileged()
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILD_MEMBERS
-        | GatewayIntents::AUTO_MODERATION_EXECUTION
-        | GatewayIntents::AUTO_MODERATION_CONFIGURATION;
+        | GatewayIntents::GUILD_MEMBERS;
 
+    let notifications = moderation_events::NotificationService::start(token);
+    let automod_service = automod::AutoModService::new(notifications);
+    let byok_service = std::env::var("OMNICORE_BYOK_MASTER_KEY_HEX")
+        .ok()
+        .and_then(|key| byok::storage::ByokService::new(&zeroize::Zeroizing::new(key), token).ok());
+    if byok_service.is_none() {
+        log::warn!("BYOK encryption key missing or invalid; BYOK setup is disabled");
+    }
+    byok::portal::maybe_start(byok_service.clone(), token);
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             owners,
             commands: cmds,
             event_handler: |ctx, event, framework, data| {
-                // pass off events to event_handler
                 Box::pin(event_handler(ctx, event, framework, data))
             },
-            command_check: Some(|ctx| {
+            command_check: Some(|_ctx| {
                 Box::pin(async move {
-                    log::info!("Checking command {} by {} in {}", ctx.command().qualified_name, get_user_name(&ctx).await, ctx.guild_id().unwrap_or(GuildId::new(1)));
                     Ok(true)
                 })
             }),
             on_error: |err| {
                 Box::pin(async move {
-                    // If it's one of these, return a better error message.
-                    // `skip` is used to prevent double logging.
                     #[allow(unused)]
                     let mut skip = false;
                     #[allow(unused)]
@@ -257,8 +258,6 @@ async fn main() {
                         _ => {}
                     }
 
-
-                    // If `Command` has dm_only
                     if dm_only {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -270,19 +269,6 @@ async fn main() {
                         return;
                     }
 
-                    // If `Command` has guild_only
-                    if guild_only {
-                        let _ = err.ctx().unwrap().send(CreateReply::default().embed(
-                            CreateEmbed::new()
-                                .description("This command can only be used in a server, please use it in a server instead of a DM.")
-                                .title(":x: Guild Only")
-                                .timestamp(Timestamp::now())
-                                .color(Colour::from_rgb(255, 0, 0)),
-                        ).reply(true).ephemeral(true)).await;
-                        return;
-                    }
-
-                    // If `Command` has subcommand_required
                     if subcommand_required {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -294,8 +280,17 @@ async fn main() {
                         return;
                     }
 
-                    // If any of the roles doesn't grant X(or more) permission but command requires X
-                    // permissions. Established in default_member_permissions and required_permissions for `Command`
+                    if guild_only {
+                        let _ = err.ctx().unwrap().send(CreateReply::default().embed(
+                            CreateEmbed::new()
+                                .description("This command can only be used in a server, please use it in a server instead of a DM.")
+                                .title(":x: Guild Only")
+                                .timestamp(Timestamp::now())
+                                .color(Colour::from_rgb(255, 0, 0)),
+                        ).reply(true).ephemeral(true)).await;
+                        return;
+                    }
+
                     if missing_user_permissions.is_some() {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -318,7 +313,6 @@ async fn main() {
                         return;
                     }
 
-                    // Setup in framework options
                     if not_an_owner {
                         let _ = err.ctx().unwrap().send(CreateReply::default().embed(
                             CreateEmbed::new()
@@ -329,7 +323,8 @@ async fn main() {
                         ).reply(true).ephemeral(true)).await;
                     }
 
-                    // If it's not one of the errors above, log and tell the user.
+
+
                     if err.ctx().is_none() && !skip {
                         log::error!("Error while handling command (context is not available): {:#?}", err);
                     } else if !skip {
@@ -346,7 +341,7 @@ async fn main() {
             },
             pre_command: |ctx| {
                         Box::pin(async move {
-                            log::info!("Executing command {} by {} in {}", ctx.command().qualified_name, get_user_name(&ctx).await, ctx.guild_id().unwrap_or(GuildId::new(1)));
+                            log::info!("Executing command {}", ctx.command().qualified_name);
                         })
                     },
             prefix_options: poise::PrefixFrameworkOptions {
@@ -367,8 +362,10 @@ async fn main() {
             },
             ..Default::default()
             })
-            .setup(|ctx, ready, framework| {
-                Box::pin(async move {
+        .setup(move |ctx, ready, framework| {
+            let automod_service = automod_service.clone();
+            let byok_service = byok_service.clone();
+            Box::pin(async move {
                     log::info!("Started OmniCore Discord Bot!");
                     log::info!("{} is in {} servers", ready.user.name, ctx.http.get_guilds(None, None).await.unwrap().len());
                     ctx.shard.set_presence(
@@ -376,7 +373,7 @@ async fn main() {
                         OnlineStatus::Online
                     );
                     poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                    Ok(Data {})
+                    Ok(Data { automod: automod_service, byok: byok_service })
                 })
             })
             .build();
@@ -399,8 +396,6 @@ async fn main() {
         log::info!("Bot has been shutdown!");
     });
 
-    // Start the shard manager.
-    // Each process doesn't need to know about other processes, since Discord handles that.
     let start_shard = config::START_SHARD.get().unwrap();
     let end_shard = config::END_SHARD.get().unwrap();
     let total_shards = config::TOTAL_SHARDS.get().unwrap();
@@ -411,7 +406,6 @@ async fn main() {
         .expect("Failed to start shard range");
 }
 
-/// Waits for Ctrl+C or SIGTERM so the bot can shut down cleanly.
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -433,17 +427,12 @@ async fn shutdown_signal() {
     }
 }
 
-/// Inserts default per-guild settings when a guild is first seen.
 async fn setup_guild(guild: GuildId) {
     let guild_id = guild.get();
     let per_guild_settings_col = database::get_collection("per_guild_settings")
         .expect("Failed to load per_guild_settings collection");
 
-    let guild_doc = doc! {
-        "guild_id": guild_id.to_string(),
-        "prefix": "!", // Default prefix
-        "ai_approved": false
-    };
+    let guild_doc = default_guild_settings(&guild_id.to_string());
 
     if per_guild_settings_col
         .find_one(doc! {"guild_id": guild_id.to_string()})
@@ -452,5 +441,33 @@ async fn setup_guild(guild: GuildId) {
         .is_none()
     {
         let _ = per_guild_settings_col.insert_one(guild_doc).await;
+    }
+}
+
+fn default_guild_settings(guild_id: &str) -> mongodb::bson::Document {
+    doc! {
+        "guild_id": guild_id,
+        "prefix": "!", // Default prefix
+        "ai_approved": false,
+        "automod": automod::config::AutoModConfig::default().to_document()
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+
+    #[test]
+    fn default_guild_settings_never_expire_by_age() {
+        let settings = default_guild_settings("guild-a");
+        assert_eq!(settings.get_str("guild_id").unwrap(), "guild-a");
+        assert!(!settings.contains_key("expiresAt"));
+        assert!(
+            settings
+                .get_document("automod")
+                .unwrap()
+                .get_bool("enabled")
+                .unwrap()
+        );
     }
 }
