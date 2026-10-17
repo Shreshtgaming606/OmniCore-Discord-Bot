@@ -30,6 +30,8 @@ The guild owner starts with `/ai setup`, opens the short-lived HTTPS link, signs
 
 Image questions addressed to OmniCore use local Ollama in bot-owner-approved servers, or a connected provider in unapproved servers. They can use images attached to the invoking message or to its exact direct reply target. See [image recognition and privacy rules](docs/VISION.md), including `/ai vision` settings and owner-only DM opt-in.
 
+In bot-owner-approved servers, `/imagegen prompt:<description>` generates a public image with local FLUX.2 Klein 4B. It posts one public status message and edits it through generation before attaching the PNG. The image model uses a separate local Ollama endpoint when `OMNICORE_IMAGEGEN_OLLAMA_URL` is set; chat and moderation keep their existing model. See [image generation operations](docs/IMAGEGEN.md).
+
 ## AI usage in development
 
 AI tools have assisted with parts of the code and documentation. The project policy is that a human reviews code and documentation.

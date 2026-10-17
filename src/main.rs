@@ -200,6 +200,7 @@ async fn main() {
         commands::analytics::analytics(),
         commands::ai::byok_commands::ai(),
         commands::ai::byok_commands::ask(),
+        commands::ai::imagegen::imagegen(),
         commands::moderation::untime::untime(),
         commands::ai::approve::approve(),
         commands::ai::disapprove::disapprove(),

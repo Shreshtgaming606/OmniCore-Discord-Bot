@@ -5,6 +5,7 @@ pub(crate) mod delete_memory;
 pub(crate) mod delete_my_data;
 pub mod disapprove;
 pub(crate) mod get_prompt;
+pub(crate) mod imagegen;
 pub(crate) mod init_ollama;
 pub(crate) mod mention;
 pub(crate) mod owner_mute;

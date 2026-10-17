@@ -2023,6 +2023,7 @@ dependencies = [
  "futures",
  "hex",
  "image",
+ "libc",
  "log",
  "log4rs",
  "mongodb",
