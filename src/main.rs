@@ -7,6 +7,7 @@ mod logging;
 mod moderation_events;
 mod retention;
 mod vision;
+mod voice;
 
 use crate::commands::ai::init_ollama::init_ollama;
 use mongodb::bson::doc;
@@ -23,6 +24,7 @@ use serenity::gateway::ActivityData;
 use serenity::model::gateway::Ready;
 use serenity::model::user::OnlineStatus;
 use serenity::prelude::*;
+use songbird::SerenityInit;
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::signal;
@@ -32,10 +34,11 @@ use tokio::signal::unix::{SignalKind, signal};
 struct Data {
     automod: std::sync::Arc<automod::AutoModService>,
     byok: Option<std::sync::Arc<byok::storage::ByokService>>,
+    voice: std::sync::Arc<voice::VoiceService>,
 }
 impl std::fmt::Debug for Data {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Data { automod: configured, byok: redacted }")
+        f.write_str("Data { automod: configured, byok: redacted, voice: configured }")
     }
 }
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -84,12 +87,27 @@ async fn event_handler(
     match event {
         serenity::FullEvent::GuildCreate { guild, .. } => {
             setup_guild(guild.id).await;
+            register_instant_guild_commands(ctx, guild.id).await;
         }
         serenity::FullEvent::GuildDelete { incomplete, .. } => {
             if !incomplete.unavailable {
+                let mut active = data.voice.active.lock().await;
+                if let Some(session) = active
+                    .as_mut()
+                    .filter(|session| session.guild == incomplete.id)
+                {
+                    session.stop();
+                    *active = None;
+                    drop(active);
+                    let _ = data.voice.manager.remove(incomplete.id).await;
+                }
                 database::delete_guild_data(&incomplete.id.to_string()).await?;
                 log::info!("Removed stored data for a departed guild");
             }
+        }
+        serenity::FullEvent::VoiceStateUpdate { new, .. } => {
+            let bot = { ctx.cache.current_user().id };
+            data.voice.voice_state(new, bot).await;
         }
         serenity::FullEvent::Message { new_message } => {
             // ignore bots (including ourselves) to avoid loops
@@ -151,6 +169,10 @@ async fn handle_bot_mention(
 
 #[tokio::main]
 async fn main() {
+    // Songbird's voice WebSocket uses rustls. Other dependencies enable both
+    // built-in crypto backends, so rustls cannot choose one implicitly.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     START_TIME
         .set(chrono::Utc::now())
         .expect("Failed to set START_TIME");
@@ -173,6 +195,9 @@ async fn main() {
     byok::storage::ensure_indexes()
         .await
         .expect("Failed to ensure BYOK usage indexes");
+    voice::ensure_indexes()
+        .await
+        .expect("Failed to ensure voice usage indexes");
 
     let mut owners: HashSet<serenity::UserId> = HashSet::from([]);
 
@@ -201,6 +226,8 @@ async fn main() {
         commands::ai::byok_commands::ai(),
         commands::ai::byok_commands::ask(),
         commands::ai::imagegen::imagegen(),
+        commands::ai::imagegen::imagine(),
+        commands::ai::imagegen::imagegenstop(),
         commands::moderation::untime::untime(),
         commands::ai::approve::approve(),
         commands::ai::disapprove::disapprove(),
@@ -212,6 +239,10 @@ async fn main() {
         commands::owner_commands::all_servers::all_servers(),
         commands::owner_commands::create_invite::create_invite(),
         commands::owner_commands::kick_self::kick_self(),
+        commands::owner_commands::restart::restart(),
+        commands::voice::voicejoin(),
+        commands::voice::voiceleave(),
+        commands::voice::voice(),
     ];
 
     let token = config::DISCORD_TOKEN.get().unwrap();
@@ -219,7 +250,8 @@ async fn main() {
         | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILD_MEMBERS;
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::GUILD_VOICE_STATES;
 
     let notifications = moderation_events::NotificationService::start(token);
     let automod_service = automod::AutoModService::new(notifications);
@@ -229,6 +261,9 @@ async fn main() {
     if byok_service.is_none() {
         log::warn!("BYOK encryption key missing or invalid; BYOK setup is disabled");
     }
+    let songbird_manager = songbird::Songbird::serenity();
+    let voice_service =
+        voice::VoiceService::new(songbird_manager.clone(), byok_service.clone(), token);
     byok::portal::maybe_start(byok_service.clone(), token);
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -378,6 +413,7 @@ async fn main() {
         .setup(move |ctx, ready, framework| {
             let automod_service = automod_service.clone();
             let byok_service = byok_service.clone();
+            let voice_service = voice_service.clone();
             Box::pin(async move {
                     log::info!("Started OmniCore Discord Bot!");
                     log::info!("{} is in {} servers", ready.user.name, ctx.http.get_guilds(None, None).await.unwrap().len());
@@ -385,8 +421,23 @@ async fn main() {
                         Some(ActivityData::custom("/help | OmniCore Discord Bot")),
                         OnlineStatus::Online
                     );
-                    poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                    Ok(Data { automod: automod_service, byok: byok_service })
+                    // Guild commands become available immediately. Keep the new operational
+                    // commands guild-scoped while registering the others globally as before.
+                    let global_commands = framework
+                        .options()
+                        .commands
+                        .iter()
+                        .filter(|command| {
+                            !matches!(command.name.as_str(), "imagegen" | "imagine" | "imagegenstop" | "restart" | "voicejoin" | "voiceleave" | "voice")
+                        })
+                        .flat_map(|command| {
+                            poise::builtins::create_application_commands(std::slice::from_ref(
+                                command,
+                            ))
+                        })
+                        .collect();
+                    serenity::Command::set_global_commands(ctx, global_commands).await?;
+                    Ok(Data { automod: automod_service, byok: byok_service, voice: voice_service })
                 })
             })
             .build();
@@ -398,6 +449,7 @@ async fn main() {
         .framework(framework)
         .cache_settings(cache_settings)
         .event_handler(Handler)
+        .register_songbird_with(songbird_manager)
         .await;
 
     let mut unwrapped_client = client.unwrap();
@@ -417,6 +469,37 @@ async fn main() {
         .start_shard_range(*start_shard..*end_shard, *total_shards)
         .await
         .expect("Failed to start shard range");
+}
+
+async fn register_instant_guild_commands(ctx: &Context, guild_id: GuildId) {
+    let builders = [
+        commands::ai::imagegen::imagegen(),
+        commands::ai::imagegen::imagine(),
+        commands::ai::imagegen::imagegenstop(),
+        commands::owner_commands::restart::restart(),
+        commands::voice::voicejoin(),
+        commands::voice::voiceleave(),
+        commands::voice::voice(),
+    ]
+    .into_iter()
+    .map(|command| {
+        command
+            .create_as_slash_command()
+            .expect("operational command must be a slash command")
+    })
+    .collect();
+    match guild_id.set_commands(ctx, builders).await {
+        Ok(commands) => log::info!(
+            "Registered {} operational commands in guild {}",
+            commands.len(),
+            guild_id
+        ),
+        Err(error) => log::error!(
+            "Failed to register operational commands in guild {}: {}",
+            guild_id,
+            error
+        ),
+    }
 }
 
 async fn shutdown_signal() {

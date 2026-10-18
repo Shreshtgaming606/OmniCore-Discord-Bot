@@ -29,3 +29,9 @@ zeroize = "1.8.2"
 axum = "0.8.6"
 image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 libc = "0.2"
+songbird = { version = "0.6.1", features = ["receive"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std"] }
+opus2 = "0.4.0"
+symphonia = { version = "0.5.5", default-features = false, features = ["wav", "pcm"] }
+whisper-rs = "0.16.0"
+sherpa-onnx = "1.13.8"

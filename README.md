@@ -32,6 +32,16 @@ Image questions addressed to OmniCore use local Ollama in bot-owner-approved ser
 
 In bot-owner-approved servers, `/imagegen prompt:<description>` generates a public image with local FLUX.2 Klein 4B. It posts one public status message and edits it through generation before attaching the PNG. The image model uses a separate local Ollama endpoint when `OMNICORE_IMAGEGEN_OLLAMA_URL` is set; chat and moderation keep their existing model. See [image generation operations](docs/IMAGEGEN.md).
 
+## Opt-in voice assistant
+
+Voice is disabled by default. The server owner enables it with `/voice settings enabled:true`, chooses `ollama` or a connected OpenAI, Anthropic, or Gemini provider, and can restrict the voice channel, role, daily request count, wake phrase, and spoken answer length. Ollama voice requires bot-owner AI approval for that server. Cloud voice uses the server's existing `/ai setup` connection, selected model, channel and role restrictions, and billing limits. Local Whisper speech recognition and Piper speech synthesis use model files from `OMNICORE_VOICE_MODEL_DIR` (default `/voice-models` in the container). The model directory must contain `ggml-base.en.bin`, `vits-piper-en_US-lessac-medium/`, and optionally `vits-piper-en_US-amy-low/` when that voice is selected. Mount it read-only in Docker.
+
+A participant joins a standard voice channel and runs `/voicejoin` in a text channel. OmniCore posts a visible status notice, then each participant runs `/voice consent enabled:true` to opt in. Say “Hey OmniCore” followed by a question. A short follow-up from the same person does not need the wake phrase. Use `/voice consent enabled:false` to withdraw consent, `/voice stop` to stop playback, `/voice test` to play a local sample, `/voice status` or `/voice stats` to inspect status and usage, and `/voiceleave` to disconnect. Only one server can host an active voice session at a time. Local image generation and voice sessions do not run together to protect memory.
+
+The bot needs View Channel, Connect, and Speak in the chosen voice channel, plus permission to send its status notice in the text channel. Existing installations may need Connect and Speak granted to the bot's role; new website invite links request them.
+
+Speech from participants without consent is not decoded for recognition. Audio and transcript text stay in temporary memory for the current session; no recording or transcript is saved to MongoDB or posted in the channel. Limited usage counts and processing times expire after 90 days. A connected cloud AI provider receives transcribed questions, not raw voice audio, under that provider's data terms. See the [privacy policy](https://discordbot.omnicoretech.org/privacy/) for details.
+
 ## AI usage in development
 
 AI tools have assisted with parts of the code and documentation. The project policy is that a human reviews code and documentation.

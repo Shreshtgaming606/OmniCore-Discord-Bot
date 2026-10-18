@@ -1,6 +1,7 @@
 pub mod all_servers;
 pub mod create_invite;
 pub mod kick_self;
+pub mod restart;
 use crate::CustomContext;
 
 /// Autocompletes guild choices by ID or name (case-insensitive substring match).

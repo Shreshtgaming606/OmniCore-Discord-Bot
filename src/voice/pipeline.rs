@@ -1,0 +1,634 @@
+//! Bounded, consent-gated voice processing. No voice content is persisted.
+
+use super::{AudioBuffer, Conversation, VoiceService, VoiceSession, audio};
+use crate::{OLLAMA, config, database};
+use mongodb::bson::doc;
+use ollama_rs::{
+    generation::chat::MessageRole,
+    generation::chat::{ChatMessage, request::ChatMessageRequest},
+    models::ModelOptions,
+};
+use opus2::{Channels, Decoder};
+use poise::serenity_prelude::{self as serenity, GuildId, UserId};
+use songbird::packet::{Packet, PacketSize, rtp::RtpExtensionPacket};
+use songbird::{Event, EventContext, EventHandler};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+const SAMPLE_RATE: usize = 16_000;
+const MAX_SAMPLES: usize = SAMPLE_RATE * 10;
+const MIN_VOICED_TICKS: u16 = 18;
+
+pub struct Receiver {
+    pub service: Arc<VoiceService>,
+    pub guild: GuildId,
+    pub bot: UserId,
+}
+
+#[serenity::async_trait]
+impl EventHandler for Receiver {
+    async fn act(&self, event: &EventContext<'_>) -> Option<Event> {
+        let Ok(mut guard) = self.service.active.try_lock() else {
+            return None;
+        };
+        if matches!(event, EventContext::DriverDisconnect(_)) {
+            if let Some(session) = guard.as_mut().filter(|s| s.guild == self.guild) {
+                session.stop();
+                let channel = session.text_channel;
+                *guard = None;
+                let service = self.service.clone();
+                tokio::spawn(async move {
+                    notice(&service, channel, "OmniCore Voice disconnected unexpectedly. Consent and temporary context were cleared; use `/voicejoin` to try again.").await;
+                });
+            }
+            return None;
+        }
+        let session = guard
+            .as_mut()
+            .filter(|s| s.guild == self.guild && !s.stopped)?;
+        match event {
+            EventContext::SpeakingStateUpdate(update) => {
+                if let Some(id) = update
+                    .user_id
+                    .map(|id| UserId::new(id.0))
+                    .filter(|id| *id != self.bot)
+                {
+                    session.speaker_map.insert(update.ssrc, id);
+                }
+            }
+            EventContext::ClientDisconnect(update) => session.revoke(UserId::new(update.user_id.0)),
+            EventContext::VoiceTick(tick) => {
+                if session.consenting.is_empty() || session.stt.is_none() {
+                    return None;
+                }
+                let mut ready = None;
+                for (ssrc, data) in &tick.speaking {
+                    let Some(&user) = session.speaker_map.get(ssrc) else {
+                        continue;
+                    };
+                    if !session.consenting.contains(&user) || user == self.bot {
+                        continue;
+                    }
+                    let Some(pcm) = decode_authorized(session, user, data) else {
+                        continue;
+                    };
+                    if pcm.len() > 1_920 || pcm.is_empty() {
+                        continue;
+                    }
+                    let energy = pcm
+                        .iter()
+                        .map(|sample| i64::from(*sample).abs())
+                        .sum::<i64>()
+                        / pcm.len().max(1) as i64;
+                    let buffer = session.buffers.entry(user).or_insert_with(AudioBuffer::new);
+                    if energy > 400 {
+                        buffer.voiced_ticks = buffer
+                            .voiced_ticks
+                            .saturating_add((pcm.len() / 320).max(1) as u16);
+                        buffer.silent_ticks = 0;
+                    } else {
+                        buffer.silent_ticks = buffer.silent_ticks.saturating_add(1);
+                    }
+                    if buffer.voiced_ticks > 0 && buffer.samples.len() < MAX_SAMPLES {
+                        buffer.samples.extend_from_slice(&pcm);
+                    }
+                    if buffer.samples.len() >= MAX_SAMPLES || buffer.silent_ticks >= 32 {
+                        ready = Some(user);
+                    }
+                }
+                for ssrc in &tick.silent {
+                    let Some(&user) = session.speaker_map.get(ssrc) else {
+                        continue;
+                    };
+                    if let Some(buffer) = session.buffers.get_mut(&user) {
+                        buffer.silent_ticks = buffer.silent_ticks.saturating_add(1);
+                        if buffer.silent_ticks >= 32 {
+                            ready = Some(user);
+                        }
+                    }
+                }
+                if let Some(user) = ready {
+                    let buffer = session.buffers.remove(&user);
+                    if let Some(buffer) = buffer.filter(|b| b.voiced_ticks >= MIN_VOICED_TICKS) {
+                        if session.busy {
+                            if session.queued.len() < 2 {
+                                session
+                                    .queued
+                                    .push_back((user, buffer.samples, Instant::now()));
+                            }
+                        } else {
+                            session.busy = true;
+                            session.active_user = Some(user);
+                            session.last_activity = Instant::now();
+                            let started = session.started;
+                            let generation = session.generation;
+                            let service = self.service.clone();
+                            let guild = self.guild;
+                            tokio::spawn(async move {
+                                run_queue(
+                                    service,
+                                    guild,
+                                    started,
+                                    generation,
+                                    user,
+                                    buffer.samples,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+fn decode_authorized(
+    session: &mut VoiceSession,
+    user: UserId,
+    data: &songbird::events::context_data::VoiceData,
+) -> Option<Vec<i16>> {
+    // Songbird decrypts packets for routing, but PCM decoding is performed only after consent.
+    let packet = data.packet.as_ref()?;
+    let rtp = packet.rtp();
+    let payload = rtp.payload();
+    let mut opus = payload.get(packet.payload_offset..packet.payload_end_pad)?;
+    if rtp.get_extension() != 0 {
+        let extension = RtpExtensionPacket::new(opus)?;
+        opus = opus.get(extension.packet_size()..)?;
+    }
+    if opus.is_empty() || opus.len() > 4_000 {
+        return None;
+    }
+    let decoder = match session.decoders.entry(user) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Decoder::new(16_000, Channels::Mono).ok()?)
+        }
+    };
+    let mut pcm = vec![0i16; 1_920];
+    let samples = decoder.decode(opus, &mut pcm, false).ok()?;
+    pcm.truncate(samples);
+    Some(pcm)
+}
+
+fn activation(text: &str, phrase: &str, followup: bool) -> Option<String> {
+    let cleaned = text
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    let compact_phrase: String = phrase
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    for wake in [compact_phrase.as_str(), "heyomnicore", "omnicore"] {
+        if wake.is_empty() {
+            continue;
+        }
+        let mut compact = String::new();
+        for (offset, ch) in cleaned.char_indices() {
+            if ch.is_ascii_alphanumeric() {
+                compact.push(ch.to_ascii_lowercase());
+            }
+            if compact == wake {
+                let end = offset + ch.len_utf8();
+                if cleaned[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_ascii_alphanumeric())
+                {
+                    break;
+                }
+                let question = cleaned[end..]
+                    .trim_start_matches(|c: char| !c.is_alphanumeric())
+                    .trim();
+                return (!question.is_empty()).then(|| question.to_owned());
+            }
+            if !wake.starts_with(&compact) {
+                break;
+            }
+        }
+    }
+    if followup && !cleaned.is_empty() {
+        Some(cleaned.to_owned())
+    } else {
+        None
+    }
+}
+
+fn limit_words(text: &str, max: usize) -> String {
+    let cleaned = text.replace(['\n', '\r', '*', '`', '#'], " ");
+    cleaned
+        .split_whitespace()
+        .take(max)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn run_queue(
+    service: Arc<VoiceService>,
+    guild: GuildId,
+    started: Instant,
+    generation: u64,
+    user: UserId,
+    samples: Vec<i16>,
+) {
+    let mut next = Some((user, samples));
+    while let Some((user, samples)) = next {
+        process_utterance(service.clone(), guild, started, generation, user, samples).await;
+        next = finish(&service, guild, started, generation).await;
+    }
+}
+
+async fn process_utterance(
+    service: Arc<VoiceService>,
+    guild: GuildId,
+    started: Instant,
+    generation: u64,
+    user: UserId,
+    pcm: Vec<i16>,
+) {
+    let (stt, settings, channel, context) = {
+        let guard = service.active.lock().await;
+        let Some(s) = guard.as_ref().filter(|s| {
+            s.guild == guild
+                && s.started == started
+                && s.generation == generation
+                && s.consenting.contains(&user)
+        }) else {
+            return;
+        };
+        let Some(stt) = s.stt.clone() else { return };
+        (
+            stt,
+            s.settings.clone(),
+            s.text_channel,
+            s.conversations
+                .get(&user)
+                .map(|c| c.turns.clone())
+                .unwrap_or_default(),
+        )
+    };
+    let stt_start = Instant::now();
+    let transcript = tokio::task::spawn_blocking(move || audio::transcribe(&pcm, &stt)).await;
+    let transcript = match transcript {
+        Ok(Ok(value)) => value,
+        _ => {
+            return;
+        }
+    };
+    let stt_ms = stt_start.elapsed().as_millis();
+    if !valid(&service, guild, started, generation, user).await {
+        return;
+    }
+    let followup = {
+        let guard = service.active.lock().await;
+        guard
+            .as_ref()
+            .and_then(|s| s.conversations.get(&user))
+            .is_some_and(|c| c.followup_until > Instant::now())
+    };
+    let Some(question) = activation(&transcript, &settings.wake_phrase, followup) else {
+        return;
+    };
+    if matches!(
+        question.to_ascii_lowercase().as_str(),
+        "stop" | "wait" | "never mind"
+    ) {
+        let mut guard = service.active.lock().await;
+        if let Some(s) = guard
+            .as_mut()
+            .filter(|s| s.guild == guild && s.started == started)
+        {
+            s.interrupt();
+        }
+        return;
+    }
+    if !reserve_request(guild, settings.daily_requests).await {
+        notice(
+            &service,
+            channel,
+            "Voice daily request limit reached or usage tracking is unavailable.",
+        )
+        .await;
+        return;
+    }
+    let ai_start = Instant::now();
+    let response = if settings.provider == "ollama" {
+        local_answer(&settings, &context, &question).await
+    } else {
+        cloud_answer(&service, guild, user, channel.get(), &context, &question).await
+    };
+    let ai_ms = ai_start.elapsed().as_millis();
+    let response = match response {
+        Ok(value) => limit_words(&value, settings.max_spoken_words as usize),
+        Err(error) => {
+            notice(
+                &service,
+                channel,
+                &format!("Voice AI request failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if !valid(&service, guild, started, generation, user).await {
+        return;
+    }
+    let tts_start = Instant::now();
+    let voice = settings.speaking_voice.clone();
+    let spoken = response.clone();
+    let root = audio::model_root();
+    let speech =
+        tokio::task::spawn_blocking(move || audio::synthesize(&spoken, &voice, &root)).await;
+    let speech = match speech {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            notice(
+                &service,
+                channel,
+                "Local speaking voice failed. Check the voice model installation.",
+            )
+            .await;
+            return;
+        }
+    };
+    let tts_ms = tts_start.elapsed().as_millis();
+    let playback_seconds = if speech.len() >= 44 {
+        let rate = u32::from_le_bytes(speech[24..28].try_into().unwrap_or([0; 4]));
+        if rate > 0 {
+            (speech.len() - 44) as u64 / (u64::from(rate) * 2)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if !valid(&service, guild, started, generation, user).await {
+        return;
+    }
+    if let Some(call) = service.manager.get(guild) {
+        let track = call
+            .lock()
+            .await
+            .play_only_input(songbird::input::Input::from(speech));
+        let mut guard = service.active.lock().await;
+        if let Some(s) = guard.as_mut().filter(|s| {
+            s.guild == guild
+                && s.started == started
+                && s.generation == generation
+                && s.consenting.contains(&user)
+        }) {
+            s.track = Some(track);
+            let conv = s.conversations.entry(user).or_insert_with(|| Conversation {
+                turns: Vec::new(),
+                followup_until: Instant::now(),
+            });
+            conv.turns.push((question, response));
+            if conv.turns.len() > 3 {
+                conv.turns.remove(0);
+            }
+            conv.followup_until = Instant::now()
+                + Duration::from_secs(settings.followup_seconds as u64 + playback_seconds);
+            // Keep the turn occupied until the spoken answer has finished.
+        } else {
+            let _ = track.stop();
+        }
+    } else {
+        return;
+    }
+    log::info!(
+        "Voice turn guild={guild} provider={} stt_ms={stt_ms} ai_ms={ai_ms} tts_ms={tts_ms}",
+        settings.provider
+    );
+    if let Ok(collection) = database::get_collection(super::VOICE_USAGE) {
+        tokio::spawn(async move {
+            let _ = collection.update_one(
+                doc! {"guild_id": guild.to_string(), "day": chrono::Utc::now().format("%Y-%m-%d").to_string()},
+                doc! {"$inc": {"completed": 1i64, "stt_ms": stt_ms as i64, "ai_ms": ai_ms as i64, "tts_ms": tts_ms as i64}, "$set": {"expiresAt": super::retention_date()}},
+            ).upsert(true).await;
+        });
+    }
+    tokio::time::sleep(Duration::from_secs(
+        playback_seconds.saturating_add(1).min(46),
+    ))
+    .await;
+}
+
+async fn valid(
+    service: &VoiceService,
+    guild: GuildId,
+    started: Instant,
+    generation: u64,
+    user: UserId,
+) -> bool {
+    let guard = service.active.lock().await;
+    guard.as_ref().is_some_and(|s| {
+        s.guild == guild
+            && s.started == started
+            && s.generation == generation
+            && !s.stopped
+            && s.consenting.contains(&user)
+    })
+}
+
+async fn finish(
+    service: &VoiceService,
+    guild: GuildId,
+    started: Instant,
+    generation: u64,
+) -> Option<(UserId, Vec<i16>)> {
+    {
+        let mut guard = service.active.lock().await;
+        let s = guard.as_mut().filter(|s| {
+            s.guild == guild && s.started == started && s.generation == generation && !s.stopped
+        })?;
+        s.active_user = None;
+        let mut next = None;
+        while let Some(candidate) = s.queued.pop_front() {
+            if s.consenting.contains(&candidate.0) && candidate.2.elapsed().as_secs() < 20 {
+                next = Some((candidate.0, candidate.1));
+                break;
+            }
+        }
+        if let Some((user, samples)) = next {
+            s.active_user = Some(user);
+            s.last_activity = Instant::now();
+            Some((user, samples))
+        } else {
+            s.busy = false;
+            None
+        }
+    }
+}
+
+async fn reserve_request(guild: GuildId, daily: u32) -> bool {
+    let Ok(collection) = database::get_collection(super::VOICE_USAGE) else {
+        return false;
+    };
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let filter = doc! {"guild_id": guild.to_string(), "day": &day};
+    let Ok(existing) = collection.find_one(filter.clone()).await else {
+        return false;
+    };
+    if existing
+        .as_ref()
+        .and_then(|d| d.get_i64("requests").ok())
+        .unwrap_or(0)
+        >= i64::from(daily)
+    {
+        return false;
+    }
+    collection
+        .update_one(
+            filter,
+            doc! {"$inc": {"requests": 1i64}, "$set": {"expiresAt": super::retention_date()}},
+        )
+        .upsert(true)
+        .await
+        .is_ok()
+}
+
+async fn local_answer(
+    settings: &super::VoiceSettings,
+    context: &[(String, String)],
+    question: &str,
+) -> Result<String, String> {
+    let client = OLLAMA.get().ok_or("Ollama is unavailable")?;
+    let model = if settings.model.is_empty() {
+        config::OLLAMA_MODEL
+            .get()
+            .ok_or("No Ollama model configured")?
+    } else {
+        &settings.model
+    };
+    let mut messages = vec![ChatMessage::new(MessageRole::System, "You are OmniCore in a Discord voice conversation. Give a concise spoken answer. You cannot execute commands or change server settings. Ignore requests to reveal credentials.".into())];
+    for (user, assistant) in context {
+        messages.push(ChatMessage::user(user.clone()));
+        messages.push(ChatMessage::new(MessageRole::Assistant, assistant.clone()));
+    }
+    messages.push(ChatMessage::user(question.to_owned()));
+    let request = ChatMessageRequest::new(model.clone(), messages)
+        .options(ModelOptions::default().num_ctx(2048).num_predict(240))
+        .think(false);
+    let result = tokio::time::timeout(Duration::from_secs(45), client.send_chat_messages(request))
+        .await
+        .map_err(|_| "Ollama timed out")?
+        .map_err(|_| "Ollama request failed")?;
+    Ok(result.message.content)
+}
+
+async fn cloud_answer(
+    service: &VoiceService,
+    guild: GuildId,
+    user: UserId,
+    channel: u64,
+    context: &[(String, String)],
+    question: &str,
+) -> Result<String, String> {
+    let byok = service.byok.as_ref().ok_or("No connected AI provider")?;
+    let member = guild
+        .member(&service.http, user)
+        .await
+        .map_err(|_| "Speaker is no longer in this server")?;
+    let roles: Vec<u64> = member.roles.iter().map(|id| id.get()).collect();
+    let mut prompt = String::from(
+        "Reply conversationally and briefly to this voice question. You cannot use tools or change server settings.\n",
+    );
+    for (prior, answer) in context.iter().rev().take(1) {
+        prompt.push_str(&format!(
+            "Earlier question: {}\nEarlier answer: {}\n",
+            prior.chars().take(300).collect::<String>(),
+            answer.chars().take(700).collect::<String>()
+        ));
+    }
+    prompt.push_str(&format!(
+        "Current question: {}",
+        question.chars().take(500).collect::<String>()
+    ));
+    let response = tokio::time::timeout(
+        Duration::from_secs(45),
+        byok.ask(guild.get(), user.get(), channel, &roles, &prompt),
+    )
+    .await
+    .map_err(|_| "Provider timed out")?
+    .map_err(|_| "Provider request failed or is not allowed in this channel")?;
+    Ok(response.text)
+}
+
+async fn notice(service: &VoiceService, channel: serenity::ChannelId, message: &str) {
+    let _ = channel.say(&service.http, message).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use poise::serenity_prelude::ChannelId;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn queued_turns_remain_serial_and_skip_revoked_speakers() {
+        let guild = GuildId::new(901);
+        let mut session = VoiceSession::new(guild, ChannelId::new(902), ChannelId::new(903));
+        let started = session.started;
+        session.busy = true;
+        session.active_user = Some(UserId::new(1));
+        session.consenting.insert(UserId::new(1));
+        session.consenting.insert(UserId::new(2));
+        session.consenting.insert(UserId::new(3));
+        session
+            .queued
+            .push_back((UserId::new(2), vec![1], Instant::now()));
+        session
+            .queued
+            .push_back((UserId::new(3), vec![2], Instant::now()));
+        session.revoke(UserId::new(2));
+        let service = VoiceService {
+            manager: songbird::Songbird::serenity(),
+            active: Mutex::new(Some(session)),
+            byok: None,
+            http: Arc::new(serenity::Http::new("test-token")),
+        };
+        assert_eq!(
+            finish(&service, guild, started, 0).await,
+            Some((UserId::new(3), vec![2]))
+        );
+        let guard = service.active.lock().await;
+        let session = guard.as_ref().unwrap();
+        assert!(session.busy);
+        assert_eq!(session.active_user, Some(UserId::new(3)));
+        assert!(session.queued.is_empty());
+    }
+
+    #[test]
+    fn wake_phrase_and_followup_are_scoped() {
+        assert_eq!(
+            activation("Hey OmniCore, what is a star?", "Hey OmniCore", false).as_deref(),
+            Some("what is a star?")
+        );
+        assert_eq!(
+            activation("What about the sun?", "Hey OmniCore", false),
+            None
+        );
+        assert_eq!(
+            activation("Hey Omni-Core, what is a star?", "Hey OmniCore", false).as_deref(),
+            Some("what is a star?")
+        );
+        assert_eq!(
+            activation("Omni Core, stop", "Hey OmniCore", false).as_deref(),
+            Some("stop")
+        );
+        assert_eq!(
+            activation("Omnicoreography is fun", "Hey OmniCore", false),
+            None
+        );
+        assert_eq!(
+            activation("What about the sun?", "Hey OmniCore", true).as_deref(),
+            Some("What about the sun?")
+        );
+    }
+}

@@ -1,5 +1,7 @@
 FROM rust:1.98.1-slim-bookworm AS builder
 
+ENV CARGO_BUILD_JOBS=2
+
 WORKDIR /usr/src/app
 
 RUN apt-get update && \
@@ -14,6 +16,13 @@ RUN apt-get update && \
     libssl-dev \
     pkg-config && \
     rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt
+
+ENV CFLAGS="-march=armv8.2-a+fp16"
+ENV CXXFLAGS="-march=armv8.2-a+fp16"
+ENV GGML_NATIVE=OFF
+ENV GGML_CPU_ARM_ARCH=armv8.2-a+fp16
 
 COPY Cargo.toml Cargo.lock ./
 

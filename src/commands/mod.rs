@@ -3,6 +3,7 @@ pub(crate) mod analytics;
 pub(crate) mod basic_utils;
 pub(crate) mod moderation;
 pub(crate) mod owner_commands;
+pub(crate) mod voice;
 
 use crate::CustomContext;
 use poise::serenity_prelude::{Member, Role, RoleId};

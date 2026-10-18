@@ -1,0 +1,686 @@
+use crate::{
+    CustomContext, Error, database,
+    voice::{VoiceSession, VoiceSettings},
+};
+use poise::{
+    CreateReply,
+    serenity_prelude::{
+        self as serenity, ChannelType, Colour, CreateAllowedMentions, CreateEmbed, EditMessage,
+        Permissions,
+    },
+};
+use std::time::Duration;
+
+#[poise::command(
+    slash_command,
+    guild_only,
+    subcommands("status", "settings", "consent", "stop", "test", "stats"),
+    subcommand_required,
+    category = "Voice"
+)]
+pub async fn voice(_ctx: CustomContext<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
+async fn private(ctx: &CustomContext<'_>, message: &str) -> Result<(), Error> {
+    ctx.send(CreateReply::default().content(message).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
+fn caller_voice_channel(ctx: &CustomContext<'_>) -> Option<serenity::ChannelId> {
+    ctx.guild()?
+        .voice_states
+        .get(&ctx.author().id)
+        .and_then(|state| state.channel_id)
+}
+
+async fn is_guild_owner(ctx: &CustomContext<'_>) -> Result<bool, Error> {
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    Ok(guild.to_partial_guild(ctx.http()).await?.owner_id == ctx.author().id)
+}
+
+fn notice(channel: serenity::ChannelId, settings: &VoiceSettings, count: usize) -> CreateEmbed {
+    CreateEmbed::new()
+        .title("OmniCore Voice Assistant")
+        .colour(Colour::from_rgb(105, 92, 230))
+        .field("Connected", format!("<#{channel}>"), true)
+        .field("AI provider", &settings.provider, true)
+        .field("Model", if settings.model.is_empty() { "Server's selected model" } else { &settings.model }, true)
+        .field("Speaking voice", &settings.speaking_voice, true)
+        .field("Wake phrase", &settings.wake_phrase, true)
+        .field("Opted-in participants", count.to_string(), true)
+        .field("Status", if count == 0 { "Waiting for consent" } else { "Ready" }, true)
+        .description("Voice processing is opt-in. Audio from participants who have not opted in is not sent to speech recognition or AI. Speech recognition and speaking voice run locally; the selected AI provider may receive opted-in transcribed questions. Use `/voice consent enabled:true` to opt in, `/voice consent enabled:false` to opt out, `/voice stop` to interrupt, and `/voiceleave` to disconnect. No recording or transcript is posted here.")
+}
+
+async fn refresh_notice(service: &crate::voice::VoiceService, guild: serenity::GuildId) {
+    let snapshot = {
+        let guard = service.active.lock().await;
+        guard.as_ref().filter(|s| s.guild == guild).and_then(|s| {
+            s.status_message.map(|id| {
+                (
+                    s.text_channel,
+                    id,
+                    s.channel,
+                    s.settings.clone(),
+                    s.consenting.len(),
+                )
+            })
+        })
+    };
+    if let Some((text, message, channel, settings, count)) = snapshot {
+        let _ = text
+            .edit_message(
+                &service.http,
+                message,
+                EditMessage::new().embed(notice(channel, &settings, count)),
+            )
+            .await;
+    }
+}
+
+async fn clear_failed_join(
+    service: &crate::voice::VoiceService,
+    guild: serenity::GuildId,
+    started: std::time::Instant,
+) {
+    {
+        let mut active = service.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|session| session.guild == guild && session.started == started)
+        {
+            if let Some(session) = active.as_mut() {
+                session.stop();
+            }
+            *active = None;
+        }
+    }
+    let _ = service.manager.remove(guild).await;
+}
+
+/// Join your current voice channel for opt-in voice conversation.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn voicejoin(ctx: CustomContext<'_>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().ok_or("Server required")?;
+    let Some(channel_id) = caller_voice_channel(&ctx) else {
+        return private(&ctx, "Join a voice channel first, then run `/voicejoin`.").await;
+    };
+    let settings = VoiceSettings::load(guild_id).await?;
+    if !settings.enabled {
+        return private(&ctx, "Voice is disabled for this server. The server owner can enable it with `/voice settings`.").await;
+    }
+    if settings
+        .allowed_voice_channel
+        .is_some_and(|allowed| allowed != channel_id.get())
+    {
+        return private(
+            &ctx,
+            "Voice is restricted to a different channel in this server.",
+        )
+        .await;
+    }
+    if let Some(role) = settings.allowed_role {
+        let member = ctx.author_member().await.ok_or("Member unavailable")?;
+        if !member.roles.iter().any(|id| id.get() == role) {
+            return private(
+                &ctx,
+                "Your role is not allowed to start a voice session here.",
+            )
+            .await;
+        }
+    }
+    if let Err(error) = crate::voice::audio::check_models(&settings.speaking_voice) {
+        log::warn!("Voice model missing: {error}");
+        return private(&ctx, "Local speech models are not installed yet. Ask an OmniCore bot owner to finish voice setup.").await;
+    }
+    if settings.provider == "ollama" {
+        if !database::is_ai_approved(guild_id.get()).await? {
+            return private(&ctx, "Local AI is not approved for this server. Ask an OmniCore bot owner to approve it, or ask the server owner to choose a connected provider in `/voice settings`.").await;
+        }
+    } else {
+        let Some(byok) = &ctx.data().byok else {
+            return private(
+                &ctx,
+                "A connected AI provider is unavailable. The server owner can run `/ai setup`.",
+            )
+            .await;
+        };
+        let connection = byok
+            .connection(guild_id.get())
+            .await
+            .map_err(|_| "AI provider settings unavailable")?;
+        if connection
+            .as_ref()
+            .is_none_or(|connected| connected.provider.name() != settings.provider)
+        {
+            return private(&ctx, "The selected AI provider is not connected. The server owner can run `/ai setup` or change `/voice settings`.").await;
+        }
+    }
+    let bot_id = ctx.cache().current_user().id;
+    let bot_member = guild_id.member(ctx.http(), bot_id).await?;
+    let (channel, permissions) = {
+        let guild = ctx.guild().ok_or("Server unavailable")?;
+        let channel = guild
+            .channels
+            .get(&channel_id)
+            .ok_or("Voice channel unavailable")?
+            .clone();
+        let permissions = guild.user_permissions_in(&channel, &bot_member);
+        (channel, permissions)
+    };
+    if channel.kind != ChannelType::Voice {
+        return private(
+            &ctx,
+            "Join a standard voice channel. Stage channels are not supported.",
+        )
+        .await;
+    }
+    if !permissions.contains(Permissions::VIEW_CHANNEL | Permissions::CONNECT | Permissions::SPEAK)
+    {
+        return private(
+            &ctx,
+            "I need View Channel, Connect, and Speak permissions in that voice channel.",
+        )
+        .await;
+    }
+    let active = ctx.data().voice.active.lock().await;
+    if active.is_some() {
+        drop(active);
+        return private(
+            &ctx,
+            "OmniCore is already in a voice session. Only one server can use voice at a time.",
+        )
+        .await;
+    }
+    if crate::commands::ai::imagegen::generation_active() {
+        drop(active);
+        return private(&ctx, "Local image generation is running. Try `/voicejoin` when it finishes so both models do not compete for memory.").await;
+    }
+    drop(active);
+    ctx.defer().await?;
+    let stt_path = crate::voice::audio::model_root().join("ggml-base.en.bin");
+    let stt =
+        match tokio::task::spawn_blocking(move || crate::voice::audio::load_stt(&stt_path)).await {
+            Ok(Ok(model)) => std::sync::Arc::new(model),
+            _ => {
+                return private(
+                    &ctx,
+                    "Local speech recognition could not load. Check the voice model installation.",
+                )
+                .await;
+            }
+        };
+    let mut session = VoiceSession::new(guild_id, channel_id, ctx.channel_id());
+    session.settings = settings.clone();
+    session.stt = Some(stt);
+    if let Some(guild) = ctx.guild() {
+        session.present = guild
+            .voice_states
+            .iter()
+            .filter_map(|(user, state)| {
+                (state.channel_id == Some(channel_id)
+                    && *user != bot_id
+                    && !guild
+                        .members
+                        .get(user)
+                        .is_some_and(|member| member.user.bot))
+                .then_some(*user)
+            })
+            .collect();
+    }
+    if session.present.is_empty() {
+        session.empty_since = Some(std::time::Instant::now());
+    }
+    let started = session.started;
+    {
+        let mut active = ctx.data().voice.active.lock().await;
+        if active.is_some() || crate::commands::ai::imagegen::generation_active() {
+            drop(active);
+            return private(&ctx, "Another voice or image-generation session started while speech recognition loaded. Try again shortly.").await;
+        }
+        *active = Some(session);
+    }
+    let call = ctx.data().voice.manager.get_or_insert(guild_id);
+    {
+        let mut call = call.lock().await;
+        call.set_config(
+            songbird::Config::default().decode_mode(songbird::driver::DecodeMode::Decrypt),
+        );
+        let receiver = || crate::voice::pipeline::Receiver {
+            service: ctx.data().voice.clone(),
+            guild: guild_id,
+            bot: bot_id,
+        };
+        call.add_global_event(
+            songbird::Event::Core(songbird::events::CoreEvent::SpeakingStateUpdate),
+            receiver(),
+        );
+        call.add_global_event(
+            songbird::Event::Core(songbird::events::CoreEvent::VoiceTick),
+            receiver(),
+        );
+        call.add_global_event(
+            songbird::Event::Core(songbird::events::CoreEvent::ClientDisconnect),
+            receiver(),
+        );
+        call.add_global_event(
+            songbird::Event::Core(songbird::events::CoreEvent::DriverDisconnect),
+            receiver(),
+        );
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(25),
+        ctx.data().voice.manager.join(guild_id, channel_id),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            clear_failed_join(&ctx.data().voice, guild_id, started).await;
+            log::warn!("Voice join failed guild={guild_id} channel={channel_id}: {error:?}");
+            private(
+                &ctx,
+                "Discord voice connection failed. Check voice permissions and try again.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(_) => {
+            clear_failed_join(&ctx.data().voice, guild_id, started).await;
+            private(
+                &ctx,
+                "Discord voice connection timed out. Please try again later.",
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    let reply = ctx
+        .send(
+            CreateReply::default()
+                .embed(notice(channel_id, &settings, 0))
+                .allowed_mentions(
+                    CreateAllowedMentions::new()
+                        .empty_users()
+                        .empty_roles()
+                        .everyone(false),
+                ),
+        )
+        .await;
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            clear_failed_join(&ctx.data().voice, guild_id, started).await;
+            return Err(error.into());
+        }
+    };
+    let status_message = reply.message().await.ok().map(|message| message.id);
+    {
+        let mut active = ctx.data().voice.active.lock().await;
+        let Some(session) = active
+            .as_mut()
+            .filter(|session| session.guild == guild_id && session.started == started)
+        else {
+            drop(active);
+            let _ = ctx.data().voice.manager.remove(guild_id).await;
+            return private(
+                &ctx,
+                "Voice connection ended during setup. Try `/voicejoin` again.",
+            )
+            .await;
+        };
+        session.status_message = status_message;
+    }
+    log::info!("Voice joined guild={guild_id} channel={channel_id}");
+    if let Ok(collection) = database::get_collection(crate::voice::VOICE_USAGE) {
+        let _ = collection.update_one(
+            mongodb::bson::doc! {"guild_id": guild_id.to_string(), "day": chrono::Utc::now().format("%Y-%m-%d").to_string()},
+            mongodb::bson::doc! {"$inc": {"sessions": 1i64}, "$set": {"expiresAt": crate::voice::retention_date()}},
+        ).upsert(true).await;
+    }
+    Ok(())
+}
+
+/// Leave the current voice channel and clear the voice session.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn voiceleave(ctx: CustomContext<'_>) -> Result<(), Error> {
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let owner = is_guild_owner(&ctx).await?;
+    let bot_owner = ctx.framework().options().owners.contains(&ctx.author().id);
+    let mut active = ctx.data().voice.active.lock().await;
+    let Some(session) = active.as_mut().filter(|session| session.guild == guild) else {
+        return private(&ctx, "OmniCore has no voice session in this server.").await;
+    };
+    if !owner && !bot_owner && caller_voice_channel(&ctx) != Some(session.channel) {
+        return private(
+            &ctx,
+            "Only a participant in this voice channel or a server owner can disconnect OmniCore.",
+        )
+        .await;
+    }
+    session.stop();
+    let started = session.started;
+    let status = session
+        .status_message
+        .map(|message| (session.text_channel, message));
+    drop(active);
+    if let Err(error) = ctx.data().voice.manager.remove(guild).await {
+        log::warn!("Voice leave failed guild={guild}: {error:?}");
+        return private(&ctx, "Voice processing stopped, but Discord did not confirm disconnection. Please retry `/voiceleave`.").await;
+    }
+    {
+        let mut active = ctx.data().voice.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|session| session.guild == guild && session.started == started)
+        {
+            *active = None;
+        }
+    }
+    if let Some((text, message)) = status {
+        let _ = text
+            .edit_message(
+                ctx.http(),
+                message,
+                EditMessage::new().embed(
+                    CreateEmbed::new()
+                        .title("OmniCore Voice Assistant")
+                        .description("Disconnected. Consent and temporary context were cleared.")
+                        .colour(Colour::DARK_GREY),
+                ),
+            )
+            .await;
+    }
+    private(
+        &ctx,
+        "Disconnected from voice. Consent and temporary session context were cleared.",
+    )
+    .await
+}
+
+/// Show the current voice session without revealing private speech.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let active = ctx.data().voice.active.lock().await;
+    let Some(session) = active.as_ref().filter(|session| session.guild == guild) else {
+        return private(&ctx, "OmniCore is not connected to voice in this server.").await;
+    };
+    let settings = &session.settings;
+    private(&ctx, &format!("Connected: <#{}>\nProcessing: {}\nAI provider: {}\nModel: {}\nWake phrase: {}\nOpted-in participants: {}\nSession duration: {} minutes\nQueue: {}", session.channel, if session.stopped { "Stopped" } else if session.consenting.is_empty() { "Waiting for consent" } else { "Ready" }, settings.provider, if settings.model.is_empty() { "Server's selected model" } else { &settings.model }, settings.wake_phrase, session.consenting.len(), session.started.elapsed().as_secs() / 60, if session.busy { "Processing one request" } else { "Idle" })).await
+}
+
+/// Configure server voice behavior (server owner only).
+#[allow(clippy::too_many_arguments)] // Each option is an independently named Discord slash-command field.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn settings(
+    ctx: CustomContext<'_>,
+    #[description = "Enable or disable voice"] enabled: Option<bool>,
+    #[description = "ollama, openai, anthropic, or gemini"] provider: Option<String>,
+    #[description = "Local Ollama model; cloud models use /ai model"] model: Option<String>,
+    #[description = "Local speaking voice"] speaking_voice: Option<String>,
+    #[description = "Activation phrase"] wake_phrase: Option<String>,
+    #[description = "Follow-up window, 5–60 seconds"] followup_seconds: Option<u32>,
+    #[description = "Idle disconnect, 1–30 minutes"] idle_minutes: Option<u32>,
+    #[description = "Maximum spoken answer, 20–150 words"] max_spoken_words: Option<u32>,
+    #[description = "Daily voice AI requests, 1–200"] daily_requests: Option<u32>,
+    #[description = "Restrict voice to this channel"] allowed_voice_channel: Option<
+        serenity::GuildChannel,
+    >,
+    #[description = "Restrict voice starts to this role"] allowed_role: Option<serenity::Role>,
+) -> Result<(), Error> {
+    if !is_guild_owner(&ctx).await? {
+        return private(&ctx, "Only this server's owner can change voice settings.").await;
+    }
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let mut current = VoiceSettings::load(guild).await?;
+    let changed = enabled.is_some()
+        || provider.is_some()
+        || model.is_some()
+        || speaking_voice.is_some()
+        || wake_phrase.is_some()
+        || followup_seconds.is_some()
+        || idle_minutes.is_some()
+        || max_spoken_words.is_some()
+        || daily_requests.is_some()
+        || allowed_voice_channel.is_some()
+        || allowed_role.is_some();
+    if let Some(value) = enabled {
+        current.enabled = value;
+    }
+    if let Some(value) = provider {
+        if !matches!(value.as_str(), "ollama" | "openai" | "anthropic" | "gemini") {
+            return private(&ctx, "Choose ollama, openai, anthropic, or gemini.").await;
+        }
+        current.provider = value;
+    }
+    if let Some(value) = model {
+        if current.provider != "ollama" {
+            return private(&ctx, "Cloud voice uses the server's existing `/ai model` selection. Set voice provider to ollama to choose a local model here.").await;
+        }
+        if value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.')
+            })
+        {
+            return private(
+                &ctx,
+                "The model ID contains unsupported characters or is too long.",
+            )
+            .await;
+        }
+        current.model = value;
+    }
+    if current.provider != "ollama" {
+        current.model.clear();
+    }
+    if let Some(value) = speaking_voice {
+        if !matches!(value.as_str(), "en_US-lessac-medium" | "en_US-amy-low") {
+            return private(&ctx, "Choose en_US-lessac-medium or en_US-amy-low.").await;
+        }
+        current.speaking_voice = value;
+    }
+    if let Some(value) = wake_phrase {
+        if !(4..=32).contains(&value.len())
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphabetic() || byte == b' ')
+        {
+            return private(&ctx, "Use 4–32 letters and spaces for the wake phrase.").await;
+        }
+        current.wake_phrase = value.trim().to_owned();
+    }
+    if let Some(value) = followup_seconds {
+        if !(5..=60).contains(&value) {
+            return private(&ctx, "Follow-up window must be 5–60 seconds.").await;
+        }
+        current.followup_seconds = value;
+    }
+    if let Some(value) = idle_minutes {
+        if !(1..=30).contains(&value) {
+            return private(&ctx, "Idle disconnect must be 1–30 minutes.").await;
+        }
+        current.idle_minutes = value;
+    }
+    if let Some(value) = max_spoken_words {
+        if !(20..=150).contains(&value) {
+            return private(&ctx, "Spoken answers must be limited to 20–150 words.").await;
+        }
+        current.max_spoken_words = value;
+    }
+    if let Some(value) = daily_requests {
+        if !(1..=200).contains(&value) {
+            return private(&ctx, "Daily voice requests must be 1–200.").await;
+        }
+        current.daily_requests = value;
+    }
+    if let Some(channel) = allowed_voice_channel {
+        if channel.guild_id != guild || channel.kind != ChannelType::Voice {
+            return private(&ctx, "Choose a standard voice channel in this server.").await;
+        }
+        current.allowed_voice_channel = Some(channel.id.get());
+    }
+    if let Some(role) = allowed_role {
+        current.allowed_role = Some(role.id.get());
+    }
+    if changed {
+        current.save(guild).await?;
+        if !current.enabled {
+            let mut guard = ctx.data().voice.active.lock().await;
+            if let Some(session) = guard.as_mut().filter(|s| s.guild == guild) {
+                session.stop();
+                *guard = None;
+                drop(guard);
+                let _ = ctx.data().voice.manager.remove(guild).await;
+            }
+        }
+    }
+    private(&ctx, &format!("Voice: {}\nAI provider: {}\nModel: {}\nSpeaking voice: {}\nWake phrase: {}\nFollow-ups: {} seconds\nIdle disconnect: {} minutes\nMaximum spoken answer: {} words\nDaily request limit: {}\nAllowed voice channel: {}\nAllowed role: {}\nSpeech recognition and TTS: local\nConsent: required for every participant\nCloud AI may incur provider charges when selected.", if current.enabled { "Enabled" } else { "Disabled" }, current.provider, if current.model.is_empty() { "Existing selected model" } else { &current.model }, current.speaking_voice, current.wake_phrase, current.followup_seconds, current.idle_minutes, current.max_spoken_words, current.daily_requests, current.allowed_voice_channel.map_or("Any".to_owned(), |id| format!("<#{id}>")), current.allowed_role.map_or("Any".to_owned(), |id| format!("<@&{id}>")))).await
+}
+
+/// Opt into or out of voice processing for the active session.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn consent(
+    ctx: CustomContext<'_>,
+    #[description = "Grant or revoke voice processing consent"] enabled: bool,
+) -> Result<(), Error> {
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let mut active = ctx.data().voice.active.lock().await;
+    let Some(session) = active
+        .as_mut()
+        .filter(|session| session.guild == guild && !session.stopped)
+    else {
+        return private(&ctx, "There is no active voice session in this server.").await;
+    };
+    if enabled {
+        if caller_voice_channel(&ctx) != Some(session.channel) {
+            return private(&ctx, "Join OmniCore's voice channel before opting in.").await;
+        }
+        if let Some(role) = session.settings.allowed_role {
+            let member = ctx.author_member().await.ok_or("Member unavailable")?;
+            if !member.roles.iter().any(|id| id.get() == role) {
+                return private(
+                    &ctx,
+                    "Your role is not allowed to use voice in this server.",
+                )
+                .await;
+            }
+        }
+        session.consenting.insert(ctx.author().id);
+        drop(active);
+        refresh_notice(&ctx.data().voice, guild).await;
+        private(&ctx, "You opted in for this voice session. Say “Hey OmniCore” to start a question. Use `/voice consent enabled:false` to opt out immediately.").await
+    } else {
+        session.revoke(ctx.author().id);
+        drop(active);
+        refresh_notice(&ctx.data().voice, guild).await;
+        private(&ctx, "You opted out. Your temporary voice buffer and conversation context have been cleared.").await
+    }
+}
+
+/// Interrupt the current spoken response immediately.
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn stop(ctx: CustomContext<'_>) -> Result<(), Error> {
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let mut guard = ctx.data().voice.active.lock().await;
+    let Some(session) = guard.as_mut().filter(|s| s.guild == guild) else {
+        return private(&ctx, "No voice session is active here.").await;
+    };
+    if caller_voice_channel(&ctx) != Some(session.channel) && !is_guild_owner(&ctx).await? {
+        return private(&ctx, "Join the active voice channel to stop playback.").await;
+    }
+    session.interrupt();
+    private(&ctx, "Voice response stopped.").await
+}
+
+/// Play a short local voice sample (server owner only).
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn test(ctx: CustomContext<'_>) -> Result<(), Error> {
+    if !is_guild_owner(&ctx).await? {
+        return private(&ctx, "Only the server owner can play the voice test.").await;
+    }
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let (voice, started) = {
+        let guard = ctx.data().voice.active.lock().await;
+        let Some(s) = guard.as_ref().filter(|s| s.guild == guild && !s.stopped) else {
+            return private(&ctx, "Use `/voicejoin` first.").await;
+        };
+        (s.settings.speaking_voice.clone(), s.started)
+    };
+    ctx.defer_ephemeral().await?;
+    let audio = tokio::task::spawn_blocking(move || {
+        crate::voice::audio::synthesize(
+            "Hello! I'm OmniCore. Voice chat is working.",
+            &voice,
+            &crate::voice::audio::model_root(),
+        )
+    })
+    .await;
+    let Ok(Ok(bytes)) = audio else {
+        return private(
+            &ctx,
+            "The local speaking voice could not generate the test sample.",
+        )
+        .await;
+    };
+    let Some(call) = ctx.data().voice.manager.get(guild) else {
+        return private(&ctx, "Voice connection was lost.").await;
+    };
+    let track = call
+        .lock()
+        .await
+        .play_only_input(songbird::input::Input::from(bytes));
+    let mut guard = ctx.data().voice.active.lock().await;
+    if let Some(s) = guard
+        .as_mut()
+        .filter(|s| s.guild == guild && s.started == started)
+    {
+        s.interrupt();
+        s.track = Some(track);
+    } else {
+        let _ = track.stop();
+    }
+    private(&ctx, "Playing the local voice test.").await
+}
+
+/// Show measured voice usage for this month (server owner only).
+#[poise::command(slash_command, guild_only, category = "Voice")]
+pub async fn stats(ctx: CustomContext<'_>) -> Result<(), Error> {
+    if !is_guild_owner(&ctx).await? {
+        return private(&ctx, "Only the server owner can view voice analytics.").await;
+    }
+    let guild = ctx.guild_id().ok_or("Server required")?;
+    let start = chrono::Utc::now().format("%Y-%m-01").to_string();
+    let collection = database::get_collection("voice_usage")?;
+    let mut cursor = collection
+        .find(mongodb::bson::doc! {"guild_id": guild.to_string(), "day": {"$gte": start}})
+        .await?;
+    use futures::TryStreamExt;
+    let mut requests = 0i64;
+    let mut completed = 0i64;
+    let mut sessions = 0i64;
+    let mut stt_ms = 0i64;
+    let mut ai_ms = 0i64;
+    let mut tts_ms = 0i64;
+    while let Some(doc) = cursor.try_next().await? {
+        requests += doc.get_i64("requests").unwrap_or(0);
+        completed += doc.get_i64("completed").unwrap_or(0);
+        sessions += doc.get_i64("sessions").unwrap_or(0);
+        stt_ms += doc.get_i64("stt_ms").unwrap_or(0);
+        ai_ms += doc.get_i64("ai_ms").unwrap_or(0);
+        tts_ms += doc.get_i64("tts_ms").unwrap_or(0);
+    }
+    let timing = if completed > 0 {
+        format!(
+            "Measured mean processing time for completed turns: STT {} ms, AI {} ms, TTS {} ms.",
+            stt_ms / completed,
+            ai_ms / completed,
+            tts_ms / completed
+        )
+    } else {
+        "No completed turns yet, so processing times are not available.".to_owned()
+    };
+    private(&ctx, &format!("This month: {sessions} sessions, {requests} AI requests, {completed} completed.\n{timing} Audio and transcripts are not stored in usage analytics.")).await
+}

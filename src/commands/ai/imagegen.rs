@@ -10,10 +10,13 @@ use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 const MODEL: &str = "x/flux2-klein:4b";
 const IMAGE_SIZE: u32 = 512;
@@ -23,6 +26,8 @@ const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 const COOLDOWN: Duration = Duration::from_secs(60);
 const QUEUE_WAIT: Duration = Duration::from_secs(120);
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(25);
+const STOP_WAIT: Duration = Duration::from_secs(45);
 const QUEUE_CAPACITY: usize = 4;
 const MIN_HOST_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -30,30 +35,99 @@ static QUEUE_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(QUEUE_CAPACITY)));
 static GENERATOR: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 static ADMISSION: LazyLock<Mutex<Admission>> = LazyLock::new(|| Mutex::new(Admission::default()));
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+
+pub fn generation_active() -> bool {
+    ADMISSION
+        .lock()
+        .is_ok_and(|state| state.jobs.values().any(|job| job.phase != JobPhase::Queued))
+}
 
 #[derive(Default)]
 struct Admission {
     active_users: HashSet<u64>,
-    active_guilds: HashSet<u64>,
+    jobs: HashMap<u64, ActiveJob>,
+    current_generator: Option<u64>,
     last_request: HashMap<u64, Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobPhase {
+    Queued,
+    Generating,
+    Finalizing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopOutcome {
+    Running,
+    Finished,
+    QueuedStopped,
+    StoppedUnloaded,
+    StoppedUnconfirmed,
+}
+
+struct ActiveJob {
+    user: u64,
+    phase: JobPhase,
+    cancel: watch::Sender<bool>,
+    done: watch::Receiver<StopOutcome>,
 }
 
 struct Reservation {
     user: u64,
     guild: u64,
+    cancel: watch::Receiver<bool>,
+    done: watch::Sender<StopOutcome>,
     _queue_slot: OwnedSemaphorePermit,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if *self.done.borrow() == StopOutcome::Running {
+            self.done.send_replace(StopOutcome::Finished);
+        }
         if let Ok(mut state) = ADMISSION.lock() {
             state.active_users.remove(&self.user);
-            state.active_guilds.remove(&self.guild);
+            state.jobs.remove(&self.guild);
+            if state.current_generator == Some(self.guild) {
+                state.current_generator = None;
+            }
+        }
+    }
+}
+
+impl Reservation {
+    fn is_cancelled(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    async fn cancelled(&mut self) {
+        while !self.is_cancelled() && self.cancel.changed().await.is_ok() {}
+    }
+
+    fn complete(&self, outcome: StopOutcome) {
+        self.done.send_replace(outcome);
+    }
+
+    fn set_phase(&self, phase: JobPhase) {
+        if let Ok(mut state) = ADMISSION.lock() {
+            if let Some(job) = state.jobs.get_mut(&self.guild) {
+                job.phase = phase;
+            }
+            if phase == JobPhase::Generating {
+                state.current_generator = Some(self.guild);
+            } else if state.current_generator == Some(self.guild) {
+                state.current_generator = None;
+            }
         }
     }
 }
 
 fn admit(user: u64, guild: u64) -> Result<Reservation, &'static str> {
+    if RESTARTING.load(Ordering::SeqCst) {
+        return Err("OmniCore is restarting. Try again in a moment.");
+    }
     let slot = QUEUE_SLOTS
         .clone()
         .try_acquire_owned()
@@ -61,6 +135,9 @@ fn admit(user: u64, guild: u64) -> Result<Reservation, &'static str> {
     let mut state = ADMISSION
         .lock()
         .map_err(|_| "Image generation is temporarily unavailable.")?;
+    if RESTARTING.load(Ordering::SeqCst) {
+        return Err("OmniCore is restarting. Try again in a moment.");
+    }
     let now = Instant::now();
     state
         .last_request
@@ -68,7 +145,7 @@ fn admit(user: u64, guild: u64) -> Result<Reservation, &'static str> {
     if state.active_users.contains(&user) {
         return Err("You already have an image request in progress.");
     }
-    if state.active_guilds.contains(&guild) {
+    if state.jobs.contains_key(&guild) {
         return Err("This server already has an image request in progress. Try again shortly.");
     }
     if let Some(previous) = state.last_request.get(&user) {
@@ -80,13 +157,109 @@ fn admit(user: u64, guild: u64) -> Result<Reservation, &'static str> {
         });
     }
     state.active_users.insert(user);
-    state.active_guilds.insert(guild);
     state.last_request.insert(user, now);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (done_tx, done_rx) = watch::channel(StopOutcome::Running);
+    state.jobs.insert(
+        guild,
+        ActiveJob {
+            user,
+            phase: JobPhase::Queued,
+            cancel: cancel_tx,
+            done: done_rx,
+        },
+    );
     Ok(Reservation {
         user,
         guild,
+        cancel: cancel_rx,
+        done: done_tx,
         _queue_slot: slot,
     })
+}
+
+fn request_stop(
+    guild: u64,
+    requester: u64,
+    bot_owner: bool,
+    guild_owner: bool,
+) -> Result<watch::Receiver<StopOutcome>, &'static str> {
+    let state = ADMISSION
+        .lock()
+        .map_err(|_| "Image generation is temporarily unavailable.")?;
+    let target = if state
+        .jobs
+        .get(&guild)
+        .is_some_and(|job| job.phase != JobPhase::Finalizing)
+    {
+        guild
+    } else if bot_owner {
+        state
+            .current_generator
+            .ok_or("No image is generating right now.")?
+    } else {
+        return Err("No image request is active in this server.");
+    };
+    let job = state
+        .jobs
+        .get(&target)
+        .ok_or("No image is generating right now.")?;
+    if requester != job.user && !bot_owner && !(guild_owner && target == guild) {
+        return Err("Only the requester or a server or bot owner can stop this image request.");
+    }
+    if job.phase == JobPhase::Finalizing {
+        return Err("The image has finished generating and is being uploaded.");
+    }
+    let done = job.done.clone();
+    job.cancel.send_replace(true);
+    Ok(done)
+}
+
+async fn wait_for_stop(done: &mut watch::Receiver<StopOutcome>) -> Option<StopOutcome> {
+    tokio::time::timeout(STOP_WAIT, async {
+        loop {
+            let outcome = *done.borrow();
+            if outcome != StopOutcome::Running {
+                return outcome;
+            }
+            if done.changed().await.is_err() {
+                return *done.borrow();
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+pub async fn stop_all_for_restart() {
+    RESTARTING.store(true, Ordering::SeqCst);
+    let mut jobs = if let Ok(state) = ADMISSION.lock() {
+        state
+            .jobs
+            .values()
+            .map(|job| {
+                if job.phase != JobPhase::Finalizing {
+                    job.cancel.send_replace(true);
+                }
+                job.done.clone()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        log::error!("Image generation state is unavailable during restart");
+        Vec::new()
+    };
+    let _ = futures::future::join_all(jobs.iter_mut().map(wait_for_stop)).await;
+    if let Some(base) = imagegen_ollama_base()
+        && let Err(error) = unload_model(&base).await
+    {
+        log::warn!("Restart could not confirm image model unload: {error:?}");
+    }
+}
+
+fn imagegen_ollama_base() -> Option<String> {
+    std::env::var("OMNICORE_IMAGEGEN_OLLAMA_URL")
+        .ok()
+        .or_else(|| config::OLLAMA_BASE_URL.get().cloned())
 }
 
 fn validate_prompt(input: &str) -> Result<String, &'static str> {
@@ -113,6 +286,7 @@ enum Stage {
     Finalizing,
     Ready,
     Failed,
+    Stopped,
 }
 
 impl Stage {
@@ -126,6 +300,7 @@ impl Stage {
             Self::Finalizing => ("Validating and preparing the image", "80%"),
             Self::Ready => ("Image ready", "100%"),
             Self::Failed => ("Failed", "—"),
+            Self::Stopped => ("Stopped", "—"),
         }
     }
 }
@@ -149,7 +324,7 @@ fn status_reply(prompt: &str, stage: Stage, reason: Option<&str>) -> CreateReply
                     "🎨 OmniCore Image Generation"
                 })
                 .description(description)
-                .colour(if stage == Stage::Failed {
+                .colour(if matches!(stage, Stage::Failed | Stage::Stopped) {
                     Colour::from_rgb(220, 70, 70)
                 } else {
                     Colour::from_rgb(105, 92, 230)
@@ -172,6 +347,7 @@ enum GenerateError {
     ModelMissing,
     UnsupportedRuntime,
     Timeout,
+    Cancelled,
     Rejected,
     BadImage,
 }
@@ -191,6 +367,7 @@ impl GenerateError {
                 "This Ollama version cannot generate images. Start the local image-capable Ollama service."
             }
             Self::Timeout => "Local generation took too long. Please try again later.",
+            Self::Cancelled => "Image generation was stopped.",
             Self::Rejected => "Local Ollama could not complete this image request.",
             Self::BadImage => "Ollama returned an invalid or oversized image.",
         }
@@ -271,9 +448,11 @@ fn decode_image(value: &serde_json::Value) -> Result<Vec<u8>, GenerateError> {
     Ok(bytes)
 }
 
-async fn generate(base: &str, prompt: &str) -> Result<Vec<u8>, GenerateError> {
+fn local_endpoint(base: &str, endpoint: &str) -> Result<String, GenerateError> {
     let parsed = reqwest::Url::parse(base).map_err(|_| GenerateError::Unavailable)?;
     if parsed.scheme() != "http"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
         || !matches!(
             parsed.host_str(),
             Some("localhost" | "127.0.0.1" | "host.docker.internal")
@@ -281,12 +460,69 @@ async fn generate(base: &str, prompt: &str) -> Result<Vec<u8>, GenerateError> {
     {
         return Err(GenerateError::Unavailable);
     }
+    Ok(format!("{}/{}", base.trim_end_matches('/'), endpoint))
+}
+
+fn image_model_loaded(value: &serde_json::Value) -> Result<bool, GenerateError> {
+    let models = value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(GenerateError::Unavailable)?;
+    Ok(models.iter().any(|model| {
+        model.get("name").and_then(serde_json::Value::as_str) == Some(MODEL)
+            || model.get("model").and_then(serde_json::Value::as_str) == Some(MODEL)
+    }))
+}
+
+async fn unload_model(base: &str) -> Result<(), GenerateError> {
+    let generate_url = local_endpoint(base, "api/generate")?;
+    let ps_url = local_endpoint(base, "api/ps")?;
+    tokio::time::timeout(UNLOAD_TIMEOUT, async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| GenerateError::Unavailable)?;
+        let response = client
+            .post(generate_url)
+            .json(&serde_json::json!({"model": MODEL, "prompt": "", "stream": false, "keep_alive": 0}))
+            .send()
+            .await
+            .map_err(|_| GenerateError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(GenerateError::Rejected);
+        }
+        for _ in 0..8 {
+            let response = client
+                .get(&ps_url)
+                .send()
+                .await
+                .map_err(|_| GenerateError::Unavailable)?;
+            if !response.status().is_success() {
+                return Err(GenerateError::Unavailable);
+            }
+            let value: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|_| GenerateError::Unavailable)?;
+            if !image_model_loaded(&value)? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Err(GenerateError::Timeout)
+    })
+    .await
+    .map_err(|_| GenerateError::Timeout)?
+}
+
+async fn generate(base: &str, prompt: &str) -> Result<Vec<u8>, GenerateError> {
+    let url = local_endpoint(base, "api/generate")?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(GENERATION_TIMEOUT)
         .build()
         .map_err(|_| GenerateError::Unavailable)?;
-    let url = format!("{}/api/generate", base.trim_end_matches('/'));
     let mut response = client
         .post(url)
         .json(&serde_json::json!({"model": MODEL, "prompt": prompt, "stream": false, "keep_alive": 0, "width": IMAGE_SIZE, "height": IMAGE_SIZE}))
@@ -389,6 +625,7 @@ impl Drop for TempImage {
     }
 }
 
+/// Generate an image locally with FLUX.2 Klein 4B.
 #[poise::command(
     slash_command,
     guild_only,
@@ -399,6 +636,24 @@ pub async fn imagegen(
     ctx: CustomContext<'_>,
     #[description = "Describe the image to generate"] prompt: String,
 ) -> Result<(), Error> {
+    run_imagegen(ctx, prompt).await
+}
+
+/// Generate an image locally with FLUX.2 Klein 4B.
+#[poise::command(
+    slash_command,
+    guild_only,
+    category = "AI",
+    description_localized("en-US", "Generate an image locally with FLUX.2 Klein 4B")
+)]
+pub async fn imagine(
+    ctx: CustomContext<'_>,
+    #[description = "Describe the image to generate"] prompt: String,
+) -> Result<(), Error> {
+    run_imagegen(ctx, prompt).await
+}
+
+async fn run_imagegen(ctx: CustomContext<'_>, prompt: String) -> Result<(), Error> {
     let started = Instant::now();
     let guild = ctx.guild_id().ok_or("Server required")?.get();
     let user = ctx.author().id.get();
@@ -442,7 +697,11 @@ pub async fn imagegen(
             return Ok(());
         }
     }
-    let _reservation = match admit(user, guild) {
+    if ctx.data().voice.active.lock().await.is_some() {
+        status.edit(ctx, status_reply(&prompt, Stage::Failed, Some("A voice session is active. Try image generation after it disconnects so the local models have enough memory."))).await?;
+        return Ok(());
+    }
+    let mut reservation = match admit(user, guild) {
         Ok(reservation) => reservation,
         Err(message) => {
             status
@@ -458,23 +717,56 @@ pub async fn imagegen(
     status
         .edit(ctx, status_reply(&prompt, Stage::Queued, None))
         .await?;
-    let _generator = match tokio::time::timeout(QUEUE_WAIT, GENERATOR.clone().acquire_owned()).await
-    {
-        Ok(Ok(permit)) => permit,
-        _ => {
-            status
-                .edit(
-                    ctx,
-                    status_reply(
-                        &prompt,
-                        Stage::Failed,
-                        Some("The local generator remained busy for too long. Try again later."),
-                    ),
-                )
-                .await?;
+    let _generator = tokio::select! {
+        biased;
+        _ = reservation.cancelled() => {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                status.edit(ctx, status_reply(&prompt, Stage::Stopped, Some("Stopped before generation started."))),
+            ).await;
+            reservation.complete(StopOutcome::QueuedStopped);
             return Ok(());
         }
+        result = tokio::time::timeout(QUEUE_WAIT, GENERATOR.clone().acquire_owned()) => {
+            match result {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    status
+                        .edit(
+                            ctx,
+                            status_reply(
+                                &prompt,
+                                Stage::Failed,
+                                Some("The local generator remained busy for too long. Try again later."),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
     };
+    if reservation.is_cancelled() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            status.edit(
+                ctx,
+                status_reply(
+                    &prompt,
+                    Stage::Stopped,
+                    Some("Stopped before generation started."),
+                ),
+            ),
+        )
+        .await;
+        reservation.complete(StopOutcome::QueuedStopped);
+        return Ok(());
+    }
+    if ctx.data().voice.active.lock().await.is_some() {
+        status.edit(ctx, status_reply(&prompt, Stage::Failed, Some("A voice session started while this request was queued. Try again after it disconnects."))).await?;
+        return Ok(());
+    }
+    reservation.set_phase(JobPhase::Generating);
     status
         .edit(ctx, status_reply(&prompt, Stage::Sending, None))
         .await?;
@@ -489,25 +781,54 @@ pub async fn imagegen(
         return Ok(());
     }
     // A dedicated local Ollama build can serve images without changing chat AI.
-    let base = std::env::var("OMNICORE_IMAGEGEN_OLLAMA_URL")
-        .ok()
-        .or_else(|| config::OLLAMA_BASE_URL.get().cloned())
-        .ok_or("Ollama URL not configured")?;
-    let request = generate(&base, &prompt);
-    tokio::pin!(request);
+    let base = imagegen_ollama_base().ok_or("Ollama URL not configured")?;
+    let mut request = Box::pin(generate(&base, &prompt));
     status
         .edit(ctx, status_reply(&prompt, Stage::Generating, None))
         .await?;
     let bytes = tokio::select! {
+        biased;
+        _ = reservation.cancelled() => Err(GenerateError::Cancelled),
         result = &mut request => result,
         _ = tokio::time::sleep(Duration::from_secs(20)) => {
-            let _ = status.edit(ctx, status_reply(&prompt, Stage::InProgress, None)).await;
-            request.await
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                status.edit(ctx, status_reply(&prompt, Stage::InProgress, None)),
+            ).await;
+            tokio::select! {
+                biased;
+                _ = reservation.cancelled() => Err(GenerateError::Cancelled),
+                result = &mut request => result,
+            }
         }
     };
+    drop(request); // Disconnect the active generation request before asking Ollama to unload.
+    if matches!(&bytes, Err(GenerateError::Cancelled)) || reservation.is_cancelled() {
+        let unloaded = unload_model(&base).await.is_ok();
+        let reason = if unloaded {
+            "Stopped; the image model was unloaded from Ollama."
+        } else {
+            "Stopped; I could not confirm that Ollama unloaded the model."
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            status.edit(ctx, status_reply(&prompt, Stage::Stopped, Some(reason))),
+        )
+        .await;
+        reservation.complete(if unloaded {
+            StopOutcome::StoppedUnloaded
+        } else {
+            StopOutcome::StoppedUnconfirmed
+        });
+        log::info!("imagegen stopped user={user} guild={guild} model_unloaded={unloaded}");
+        return Ok(());
+    }
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(error) => {
+            if let Err(unload_error) = unload_model(&base).await {
+                log::warn!("imagegen cleanup could not confirm model unload: {unload_error:?}");
+            }
             log::warn!(
                 "imagegen failed user={user} guild={guild} channel={channel} duration_ms={} reason={error:?}",
                 started.elapsed().as_millis()
@@ -521,6 +842,7 @@ pub async fn imagegen(
             return Ok(());
         }
     };
+    reservation.set_phase(JobPhase::Finalizing);
     status
         .edit(ctx, status_reply(&prompt, Stage::Finalizing, None))
         .await?;
@@ -588,9 +910,41 @@ pub async fn imagegen(
     Ok(())
 }
 
+/// Stop your image request; server and bot owners can also stop requests they manage.
+#[poise::command(slash_command, guild_only, category = "AI")]
+pub async fn imagegenstop(ctx: CustomContext<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let guild = ctx.guild_id().ok_or("Server required")?.get();
+    let user = ctx.author().id.get();
+    let bot_owner = ctx.framework().options().owners.contains(&ctx.author().id);
+    let guild_owner = ctx
+        .guild()
+        .is_some_and(|current| current.owner_id == ctx.author().id);
+    let message = match request_stop(guild, user, bot_owner, guild_owner) {
+        Ok(mut done) => match wait_for_stop(&mut done).await {
+            Some(StopOutcome::QueuedStopped) => {
+                "Your image request was removed from the queue; it had not loaded the model."
+            }
+            Some(StopOutcome::StoppedUnloaded) => {
+                "Image generation stopped and the FLUX model was unloaded from Ollama. macOS may take a moment to reclaim the RAM."
+            }
+            Some(StopOutcome::StoppedUnconfirmed) => {
+                "Image generation stopped, but I could not confirm that Ollama unloaded the model."
+            }
+            Some(StopOutcome::Finished) => "The image request finished before it could be stopped.",
+            _ => "Stop requested, but model unloading has not been confirmed yet.",
+        },
+        Err(message) => message,
+    };
+    ctx.send(CreateReply::default().content(message).ephemeral(true))
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    static ADMISSION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn prompt_validation() {
@@ -604,7 +958,15 @@ mod tests {
     fn public_stages_and_registration() {
         let command = imagegen();
         assert_eq!(command.name, "imagegen");
+        assert_eq!(
+            command.description.as_deref(),
+            Some("Generate an image locally with FLUX.2 Klein 4B.")
+        );
         assert!(command.slash_action.is_some());
+        let alias = imagine();
+        assert_eq!(alias.name, "imagine");
+        assert_eq!(alias.description, command.description);
+        assert!(alias.slash_action.is_some());
         for stage in [
             Stage::Received,
             Stage::Queued,
@@ -614,6 +976,7 @@ mod tests {
             Stage::Finalizing,
             Stage::Ready,
             Stage::Failed,
+            Stage::Stopped,
         ] {
             let reply = status_reply("a gray cat", stage, None);
             assert_eq!(reply.ephemeral, Some(false));
@@ -623,6 +986,7 @@ mod tests {
 
     #[test]
     fn queue_enforces_user_guild_and_cooldown() {
+        let _lock = ADMISSION_TEST_LOCK.lock().unwrap();
         let first = admit(991_000_001, 991_000_002).ok().unwrap();
         assert!(admit(991_000_001, 991_000_003).is_err());
         assert!(admit(991_000_004, 991_000_002).is_err());
@@ -641,6 +1005,33 @@ mod tests {
             Err("The image generation queue is full. Try again shortly.")
         ));
         drop(reservations);
+    }
+
+    #[test]
+    fn stop_respects_requester_and_owner_scopes() {
+        let _lock = ADMISSION_TEST_LOCK.lock().unwrap();
+        let own_guild = 996_000_001;
+        let other_guild = 996_000_002;
+        let job = admit(996_000_003, own_guild).unwrap();
+        assert!(request_stop(own_guild, 996_000_004, false, false).is_err());
+        assert!(request_stop(other_guild, 996_000_003, false, false).is_err());
+        let done = request_stop(own_guild, 996_000_003, false, false).unwrap();
+        assert!(job.is_cancelled());
+        job.complete(StopOutcome::QueuedStopped);
+        drop(job);
+        assert_eq!(*done.borrow(), StopOutcome::QueuedStopped);
+
+        let generating = admit(996_000_005, own_guild).unwrap();
+        generating.set_phase(JobPhase::Generating);
+        let done = request_stop(other_guild, 996_000_006, true, false).unwrap();
+        assert!(generating.is_cancelled());
+        drop(generating);
+        assert_eq!(*done.borrow(), StopOutcome::Finished);
+
+        let server_job = admit(996_000_007, own_guild).unwrap();
+        assert!(request_stop(own_guild, 996_000_008, false, true).is_ok());
+        assert!(server_job.is_cancelled());
+        drop(server_job);
     }
 
     #[test]
@@ -713,6 +1104,37 @@ mod tests {
         assert!(matches!(
             generate(&format!("http://{address}"), "cat").await,
             Err(GenerateError::ModelMissing)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_unloads_only_the_image_model_and_confirms_it_is_gone() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/api/generate",
+                post(|Json(request): Json<serde_json::Value>| async move {
+                    assert_eq!(request["model"], MODEL);
+                    assert_eq!(request["prompt"], "");
+                    assert_eq!(request["keep_alive"], 0);
+                    Json(serde_json::json!({"done": true, "done_reason": "unload"}))
+                }),
+            )
+            .route(
+                "/api/ps",
+                get(|| async { Json(serde_json::json!({"models": []})) }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        unload_model(&format!("http://{address}")).await.unwrap();
+        assert!(matches!(
+            unload_model("http://example.com").await,
+            Err(GenerateError::Unavailable)
         ));
         server.abort();
     }
