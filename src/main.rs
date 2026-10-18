@@ -87,7 +87,7 @@ async fn event_handler(
     match event {
         serenity::FullEvent::GuildCreate { guild, .. } => {
             setup_guild(guild.id).await;
-            register_instant_guild_commands(ctx, guild.id).await;
+            register_instant_guild_commands(&ctx.http, guild.id).await;
         }
         serenity::FullEvent::GuildDelete { incomplete, .. } => {
             if !incomplete.unavailable {
@@ -243,6 +243,7 @@ async fn main() {
         commands::voice::voicejoin(),
         commands::voice::voiceleave(),
         commands::voice::voice(),
+        commands::voice::voiceadmin(),
     ];
 
     let token = config::DISCORD_TOKEN.get().unwrap();
@@ -262,8 +263,13 @@ async fn main() {
         log::warn!("BYOK encryption key missing or invalid; BYOK setup is disabled");
     }
     let songbird_manager = songbird::Songbird::serenity();
-    let voice_service =
-        voice::VoiceService::new(songbird_manager.clone(), byok_service.clone(), token);
+    let voice_killed = voice::policy::killed().await.unwrap_or(true);
+    let voice_service = voice::VoiceService::new(
+        songbird_manager.clone(),
+        byok_service.clone(),
+        token,
+        voice_killed,
+    );
     byok::portal::maybe_start(byok_service.clone(), token);
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -437,6 +443,17 @@ async fn main() {
                         })
                         .collect();
                     serenity::Command::set_global_commands(ctx, global_commands).await?;
+                    let http = ctx.http.clone();
+                    tokio::spawn(async move {
+                        match http.get_guilds(None, None).await {
+                            Ok(guilds) => {
+                                for guild in guilds {
+                                    register_instant_guild_commands(&http, guild.id).await;
+                                }
+                            }
+                            Err(error) => log::error!("Could not refresh guild command access: {error}"),
+                        }
+                    });
                     Ok(Data { automod: automod_service, byok: byok_service, voice: voice_service })
                 })
             })
@@ -471,24 +488,31 @@ async fn main() {
         .expect("Failed to start shard range");
 }
 
-async fn register_instant_guild_commands(ctx: &Context, guild_id: GuildId) {
-    let builders = [
+pub(crate) async fn register_instant_guild_commands(http: &serenity::Http, guild_id: GuildId) {
+    let mut commands = vec![
         commands::ai::imagegen::imagegen(),
         commands::ai::imagegen::imagine(),
         commands::ai::imagegen::imagegenstop(),
         commands::owner_commands::restart::restart(),
-        commands::voice::voicejoin(),
-        commands::voice::voiceleave(),
-        commands::voice::voice(),
-    ]
-    .into_iter()
-    .map(|command| {
-        command
-            .create_as_slash_command()
-            .expect("operational command must be a slash command")
-    })
-    .collect();
-    match guild_id.set_commands(ctx, builders).await {
+    ];
+    match voice::policy::allowed(guild_id).await {
+        Ok(true) => commands.extend([
+            commands::voice::voicejoin(),
+            commands::voice::voiceleave(),
+            commands::voice::voice(),
+        ]),
+        Ok(false) => {}
+        Err(error) => log::warn!("Voice approval lookup failed guild={guild_id}: {error}"),
+    }
+    let builders = commands
+        .into_iter()
+        .map(|command| {
+            command
+                .create_as_slash_command()
+                .expect("operational command must be a slash command")
+        })
+        .collect();
+    match guild_id.set_commands(http, builders).await {
         Ok(commands) => log::info!(
             "Registered {} operational commands in guild {}",
             commands.len(),

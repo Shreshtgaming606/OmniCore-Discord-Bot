@@ -325,6 +325,9 @@ pub async fn delete_guild_ai_history(guild_id: &str) -> mongodb::error::Result<(
 
 /// Called after a verified guild removal or an internally authorized server deletion request.
 pub async fn delete_guild_data(guild_id: &str) -> mongodb::error::Result<()> {
+    get_collection("voice_access")?
+        .delete_one(doc! { "_id": guild_id })
+        .await?;
     crate::byok::storage::delete_guild(guild_id).await?;
     get_collection(crate::voice::VOICE_USAGE)?
         .delete_many(guild_filter(guild_id))

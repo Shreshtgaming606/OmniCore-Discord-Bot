@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 pub mod audio;
 pub mod pipeline;
+pub mod policy;
 pub const VOICE_USAGE: &str = "voice_usage";
 
 pub fn retention_date() -> DateTime {
@@ -129,6 +130,7 @@ pub struct VoiceService {
     pub active: Mutex<Option<VoiceSession>>,
     pub byok: Option<Arc<crate::byok::storage::ByokService>>,
     pub http: Arc<serenity::Http>,
+    pub killed: std::sync::atomic::AtomicBool,
 }
 
 impl VoiceService {
@@ -136,12 +138,14 @@ impl VoiceService {
         manager: Arc<Songbird>,
         byok: Option<Arc<crate::byok::storage::ByokService>>,
         token: &str,
+        killed: bool,
     ) -> Arc<Self> {
         let service = Arc::new(Self {
             manager,
             active: Mutex::new(None),
             byok,
             http: Arc::new(serenity::Http::new(token)),
+            killed: std::sync::atomic::AtomicBool::new(killed),
         });
         Self::start_housekeeping(service.clone());
         service
@@ -257,9 +261,13 @@ pub struct VoiceSession {
     pub queued: VecDeque<(UserId, Vec<i16>, Instant)>,
     pub generation: u64,
     pub track: Option<songbird::tracks::TrackHandle>,
+    pub worker: Option<tokio::task::JoinHandle<()>>,
     pub present: HashSet<UserId>,
     pub empty_since: Option<Instant>,
     pub stopped: bool,
+    pub received_packets: u64,
+    pub authorized_packets: u64,
+    pub decoded_packets: u64,
 }
 
 impl VoiceSession {
@@ -283,9 +291,13 @@ impl VoiceSession {
             queued: VecDeque::new(),
             generation: 0,
             track: None,
+            worker: None,
             present: HashSet::new(),
             empty_since: None,
             stopped: false,
+            received_packets: 0,
+            authorized_packets: 0,
+            decoded_packets: 0,
         }
     }
 
@@ -306,6 +318,9 @@ impl VoiceSession {
         self.busy = false;
         self.active_user = None;
         self.queued.clear();
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
+        }
         if let Some(track) = self.track.take() {
             let _ = track.stop();
         }
@@ -351,5 +366,18 @@ mod tests {
         let generation = session.generation;
         session.revoke(UserId::new(5));
         assert_eq!(session.generation, generation);
+    }
+
+    #[tokio::test]
+    async fn stopping_voice_cancels_the_worker_and_clears_temporary_state() {
+        let mut session = VoiceSession::new(GuildId::new(1), ChannelId::new(2), ChannelId::new(3));
+        session.consenting.insert(UserId::new(4));
+        session.buffers.insert(UserId::new(4), AudioBuffer::new());
+        session.worker = Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        session.stop();
+        assert!(session.stopped);
+        assert!(session.worker.is_none());
+        assert!(session.consenting.is_empty());
+        assert!(session.buffers.is_empty());
     }
 }

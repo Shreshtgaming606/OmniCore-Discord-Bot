@@ -9,7 +9,250 @@ use poise::{
         Permissions,
     },
 };
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+#[poise::command(
+    slash_command,
+    dm_only,
+    subcommands("kill", "resume", "approve", "revoke", "admin_status"),
+    subcommand_required,
+    category = "Voice"
+)]
+pub async fn voiceadmin(_ctx: CustomContext<'_>) -> Result<(), Error> {
+    Ok(())
+}
+
+fn bot_owner(ctx: &CustomContext<'_>) -> bool {
+    ctx.guild_id().is_none()
+        && crate::config::DEVELOPER_IDS
+            .get()
+            .is_some_and(|owners| owners.contains(&ctx.author().id.get()))
+}
+
+async fn disconnect_active(service: &crate::voice::VoiceService, reason: &str) -> Option<String> {
+    let old = {
+        let mut guard = service.active.lock().await;
+        guard.take().map(|mut session| {
+            session.stop();
+            session
+        })
+    };
+    let old = old?;
+    let guild = old.guild;
+    let model = (old.settings.provider == "ollama").then(|| {
+        if old.settings.model.is_empty() {
+            crate::config::OLLAMA_MODEL
+                .get()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            old.settings.model.clone()
+        }
+    });
+    let _ = service.manager.remove(guild).await;
+    if let Some(message) = old.status_message {
+        let _ = old
+            .text_channel
+            .edit_message(
+                &service.http,
+                message,
+                EditMessage::new().embed(
+                    CreateEmbed::new()
+                        .title("OmniCore Voice Assistant")
+                        .description(reason)
+                        .colour(Colour::DARK_GREY),
+                ),
+            )
+            .await;
+    }
+    let _ = old.text_channel.say(&service.http, reason).await;
+    model
+}
+
+fn voice_model_loaded(body: &serde_json::Value, model: &str) -> Option<bool> {
+    let models = body.get("models")?.as_array()?;
+    Some(models.iter().any(|entry| {
+        entry
+            .get("name")
+            .or_else(|| entry.get("model"))
+            .and_then(serde_json::Value::as_str)
+            == Some(model)
+    }))
+}
+
+async fn unload_voice_model(model: &str) -> bool {
+    if model.is_empty() {
+        return true;
+    }
+    let Some(base) = crate::config::OLLAMA_BASE_URL.get() else {
+        return false;
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let ps_url = format!("{base}/api/ps");
+    let Ok(response) = client.get(&ps_url).send().await else {
+        return false;
+    };
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    let Some(loaded) = voice_model_loaded(&body, model) else {
+        return false;
+    };
+    if !loaded {
+        return true;
+    }
+    let Ok(response) = client
+        .post(format!("{base}/api/generate"))
+        .json(&serde_json::json!({"model": model, "prompt": "", "stream": false, "keep_alive": 0}))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    for _ in 0..5 {
+        let Ok(response) = client.get(&ps_url).send().await else {
+            return false;
+        };
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        let Some(loaded) = voice_model_loaded(&body, model) else {
+            return false;
+        };
+        if !loaded {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    false
+}
+
+/// Stop all voice use and free the active local voice models (bot owners, DM only).
+#[poise::command(slash_command, dm_only)]
+pub async fn kill(ctx: CustomContext<'_>) -> Result<(), Error> {
+    if !bot_owner(&ctx) {
+        return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
+    }
+    ctx.data().voice.killed.store(true, Ordering::SeqCst);
+    let model = disconnect_active(
+        &ctx.data().voice,
+        "Voice stopped by an OmniCore bot owner. Consent and temporary voice context were cleared.",
+    )
+    .await;
+    crate::voice::policy::set_killed(true).await?;
+    let unloaded = match model {
+        Some(model) => unload_voice_model(&model).await,
+        None => true,
+    };
+    let memory = if unloaded {
+        "The voice Ollama model is not loaded."
+    } else {
+        "I could not confirm that Ollama unloaded the voice model; check `ollama ps` on the Mac."
+    };
+    private(&ctx, &format!("Voice kill switch is on. The active session was disconnected and temporary buffers and speech recognition were released. {memory} Use `/voiceadmin resume` to allow new sessions.")).await
+}
+
+/// Allow new voice sessions after an emergency stop (bot owners, DM only).
+#[poise::command(slash_command, dm_only)]
+pub async fn resume(ctx: CustomContext<'_>) -> Result<(), Error> {
+    if !bot_owner(&ctx) {
+        return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
+    }
+    crate::voice::policy::set_killed(false).await?;
+    ctx.data().voice.killed.store(false, Ordering::SeqCst);
+    private(
+        &ctx,
+        "Voice is available again in approved servers. No voice session was started automatically.",
+    )
+    .await
+}
+
+fn guild_id(raw: &str) -> Result<serenity::GuildId, &'static str> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| *value != 0)
+        .map(serenity::GuildId::new)
+        .ok_or("Enter a valid numeric server ID.")
+}
+
+/// Approve voice in another server where OmniCore is installed (bot owners, DM only).
+#[poise::command(slash_command, dm_only)]
+pub async fn approve(
+    ctx: CustomContext<'_>,
+    #[description = "Numeric Discord server ID"] server_id: String,
+) -> Result<(), Error> {
+    if !bot_owner(&ctx) {
+        return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
+    }
+    let guild = guild_id(&server_id)?;
+    if guild.to_partial_guild(ctx.http()).await.is_err() {
+        return private(&ctx, "OmniCore is not in that server or cannot access it.").await;
+    }
+    crate::voice::policy::approve(guild).await?;
+    crate::register_instant_guild_commands(ctx.http(), guild).await;
+    private(&ctx, &format!("Voice approved for server {guild}. Its server owner can enable voice with `/voice settings enabled:true`." )).await
+}
+
+/// Revoke a previous voice approval (bot owners, DM only).
+#[poise::command(slash_command, dm_only)]
+pub async fn revoke(
+    ctx: CustomContext<'_>,
+    #[description = "Numeric Discord server ID"] server_id: String,
+) -> Result<(), Error> {
+    if !bot_owner(&ctx) {
+        return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
+    }
+    let guild = guild_id(&server_id)?;
+    if crate::voice::policy::builtin(guild) {
+        return private(&ctx, "This is one of the three built-in voice servers. Use `/voiceadmin kill` to stop all voice use.").await;
+    }
+    crate::voice::policy::revoke(guild).await?;
+    crate::register_instant_guild_commands(ctx.http(), guild).await;
+    let active = ctx
+        .data()
+        .voice
+        .active
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|s| s.guild == guild);
+    if active {
+        let _ = disconnect_active(
+            &ctx.data().voice,
+            "Voice access was revoked by an OmniCore bot owner.",
+        )
+        .await;
+    }
+    private(&ctx, &format!("Voice approval revoked for server {guild}.")).await
+}
+
+/// View the voice kill switch and active server (bot owners, DM only).
+#[poise::command(slash_command, dm_only, rename = "status")]
+pub async fn admin_status(ctx: CustomContext<'_>) -> Result<(), Error> {
+    if !bot_owner(&ctx) {
+        return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
+    }
+    let active = ctx
+        .data()
+        .voice
+        .active
+        .lock()
+        .await
+        .as_ref()
+        .map(|s| s.guild.to_string());
+    private(&ctx, &format!("Kill switch: {}\nActive server: {}\nBuilt-in voice servers: SMS, Minecraft Server, OmniCore Technologies.",
+        if ctx.data().voice.killed.load(Ordering::SeqCst) { "On" } else { "Off" }, active.as_deref().unwrap_or("None"))).await
+}
 
 #[poise::command(
     slash_command,
@@ -48,10 +291,9 @@ fn notice(channel: serenity::ChannelId, settings: &VoiceSettings, count: usize) 
         .field("AI provider", &settings.provider, true)
         .field("Model", if settings.model.is_empty() { "Server's selected model" } else { &settings.model }, true)
         .field("Speaking voice", &settings.speaking_voice, true)
-        .field("Wake phrase", &settings.wake_phrase, true)
         .field("Opted-in participants", count.to_string(), true)
         .field("Status", if count == 0 { "Waiting for consent" } else { "Ready" }, true)
-        .description("Voice processing is opt-in. Audio from participants who have not opted in is not sent to speech recognition or AI. Speech recognition and speaking voice run locally; the selected AI provider may receive opted-in transcribed questions. Use `/voice consent enabled:true` to opt in, `/voice consent enabled:false` to opt out, `/voice stop` to interrupt, and `/voiceleave` to disconnect. No recording or transcript is posted here.")
+        .description("Voice processing is opt-in. After you consent, speak normally; no wake phrase is needed. Recognized speech and OmniCore's text response are posted in this text channel. Speech recognition and speaking voice run locally; the selected AI provider may receive transcribed questions. Use `/voice consent enabled:false` to opt out or `/voiceleave` to disconnect.")
 }
 
 async fn refresh_notice(service: &crate::voice::VoiceService, guild: serenity::GuildId) {
@@ -104,6 +346,16 @@ async fn clear_failed_join(
 #[poise::command(slash_command, guild_only, category = "Voice")]
 pub async fn voicejoin(ctx: CustomContext<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().ok_or("Server required")?;
+    if ctx.data().voice.killed.load(Ordering::SeqCst) {
+        return private(&ctx, "Voice is paused by an OmniCore bot owner.").await;
+    }
+    if !crate::voice::policy::allowed(guild_id).await? {
+        return private(
+            &ctx,
+            "Voice has not been approved for this server by an OmniCore bot owner.",
+        )
+        .await;
+    }
     let Some(channel_id) = caller_voice_channel(&ctx) else {
         return private(&ctx, "Join a voice channel first, then run `/voicejoin`.").await;
     };
@@ -236,6 +488,11 @@ pub async fn voicejoin(ctx: CustomContext<'_>) -> Result<(), Error> {
     let started = session.started;
     {
         let mut active = ctx.data().voice.active.lock().await;
+        if ctx.data().voice.killed.load(Ordering::SeqCst)
+            || !crate::voice::policy::allowed(guild_id).await?
+        {
+            return private(&ctx, "Voice access changed while speech recognition loaded. Try again after a bot owner enables voice.").await;
+        }
         if active.is_some() || crate::commands::ai::imagegen::generation_active() {
             drop(active);
             return private(&ctx, "Another voice or image-generation session started while speech recognition loaded. Try again shortly.").await;
@@ -259,6 +516,10 @@ pub async fn voicejoin(ctx: CustomContext<'_>) -> Result<(), Error> {
         );
         call.add_global_event(
             songbird::Event::Core(songbird::events::CoreEvent::VoiceTick),
+            receiver(),
+        );
+        call.add_global_event(
+            songbird::Event::Core(songbird::events::CoreEvent::RtpPacket),
             receiver(),
         );
         call.add_global_event(
@@ -409,7 +670,7 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         return private(&ctx, "OmniCore is not connected to voice in this server.").await;
     };
     let settings = &session.settings;
-    private(&ctx, &format!("Connected: <#{}>\nProcessing: {}\nAI provider: {}\nModel: {}\nWake phrase: {}\nOpted-in participants: {}\nSession duration: {} minutes\nQueue: {}", session.channel, if session.stopped { "Stopped" } else if session.consenting.is_empty() { "Waiting for consent" } else { "Ready" }, settings.provider, if settings.model.is_empty() { "Server's selected model" } else { &settings.model }, settings.wake_phrase, session.consenting.len(), session.started.elapsed().as_secs() / 60, if session.busy { "Processing one request" } else { "Idle" })).await
+    private(&ctx, &format!("Connected: <#{}>\nProcessing: {}\nAI provider: {}\nModel: {}\nWake phrase: none\nOpted-in participants: {}\nSession duration: {} minutes\nQueue: {}\nAudio packets: received {}, opted-in {}, decoded {}", session.channel, if session.stopped { "Stopped" } else if session.consenting.is_empty() { "Waiting for consent" } else { "Ready" }, settings.provider, if settings.model.is_empty() { "Server's selected model" } else { &settings.model }, session.consenting.len(), session.started.elapsed().as_secs() / 60, if session.busy { "Processing one request" } else { "Idle" }, session.received_packets, session.authorized_packets, session.decoded_packets)).await
 }
 
 /// Configure server voice behavior (server owner only).
@@ -421,7 +682,6 @@ pub async fn settings(
     #[description = "ollama, openai, anthropic, or gemini"] provider: Option<String>,
     #[description = "Local Ollama model; cloud models use /ai model"] model: Option<String>,
     #[description = "Local speaking voice"] speaking_voice: Option<String>,
-    #[description = "Activation phrase"] wake_phrase: Option<String>,
     #[description = "Follow-up window, 5–60 seconds"] followup_seconds: Option<u32>,
     #[description = "Idle disconnect, 1–30 minutes"] idle_minutes: Option<u32>,
     #[description = "Maximum spoken answer, 20–150 words"] max_spoken_words: Option<u32>,
@@ -440,13 +700,19 @@ pub async fn settings(
         || provider.is_some()
         || model.is_some()
         || speaking_voice.is_some()
-        || wake_phrase.is_some()
         || followup_seconds.is_some()
         || idle_minutes.is_some()
         || max_spoken_words.is_some()
         || daily_requests.is_some()
         || allowed_voice_channel.is_some()
         || allowed_role.is_some();
+    if enabled == Some(true) && !crate::voice::policy::allowed(guild).await? {
+        return private(
+            &ctx,
+            "An OmniCore bot owner must approve voice for this server first.",
+        )
+        .await;
+    }
     if let Some(value) = enabled {
         current.enabled = value;
     }
@@ -481,16 +747,6 @@ pub async fn settings(
             return private(&ctx, "Choose en_US-lessac-medium or en_US-amy-low.").await;
         }
         current.speaking_voice = value;
-    }
-    if let Some(value) = wake_phrase {
-        if !(4..=32).contains(&value.len())
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphabetic() || byte == b' ')
-        {
-            return private(&ctx, "Use 4–32 letters and spaces for the wake phrase.").await;
-        }
-        current.wake_phrase = value.trim().to_owned();
     }
     if let Some(value) = followup_seconds {
         if !(5..=60).contains(&value) {
@@ -537,7 +793,7 @@ pub async fn settings(
             }
         }
     }
-    private(&ctx, &format!("Voice: {}\nAI provider: {}\nModel: {}\nSpeaking voice: {}\nWake phrase: {}\nFollow-ups: {} seconds\nIdle disconnect: {} minutes\nMaximum spoken answer: {} words\nDaily request limit: {}\nAllowed voice channel: {}\nAllowed role: {}\nSpeech recognition and TTS: local\nConsent: required for every participant\nCloud AI may incur provider charges when selected.", if current.enabled { "Enabled" } else { "Disabled" }, current.provider, if current.model.is_empty() { "Existing selected model" } else { &current.model }, current.speaking_voice, current.wake_phrase, current.followup_seconds, current.idle_minutes, current.max_spoken_words, current.daily_requests, current.allowed_voice_channel.map_or("Any".to_owned(), |id| format!("<#{id}>")), current.allowed_role.map_or("Any".to_owned(), |id| format!("<@&{id}>")))).await
+    private(&ctx, &format!("Voice: {}\nAI provider: {}\nModel: {}\nSpeaking voice: {}\nWake phrase: none\nFollow-ups: {} seconds\nIdle disconnect: {} minutes\nMaximum spoken answer: {} words\nDaily request limit: {}\nAllowed voice channel: {}\nAllowed role: {}\nSpeech recognition and TTS: local\nConsent: required for every participant; transcripts and text responses appear in the voice session's text channel.\nCloud AI may incur provider charges when selected.", if current.enabled { "Enabled" } else { "Disabled" }, current.provider, if current.model.is_empty() { "Existing selected model" } else { &current.model }, current.speaking_voice, current.followup_seconds, current.idle_minutes, current.max_spoken_words, current.daily_requests, current.allowed_voice_channel.map_or("Any".to_owned(), |id| format!("<#{id}>")), current.allowed_role.map_or("Any".to_owned(), |id| format!("<@&{id}>")))).await
 }
 
 /// Opt into or out of voice processing for the active session.
@@ -571,7 +827,7 @@ pub async fn consent(
         session.consenting.insert(ctx.author().id);
         drop(active);
         refresh_notice(&ctx.data().voice, guild).await;
-        private(&ctx, "You opted in for this voice session. Say “Hey OmniCore” to start a question. Use `/voice consent enabled:false` to opt out immediately.").await
+        private(&ctx, "You opted in for this voice session. Speak normally; no wake phrase is needed. Your recognized speech and OmniCore's text responses will appear in the text channel where `/voicejoin` was run. Use `/voice consent enabled:false` to opt out immediately.").await
     } else {
         session.revoke(ctx.author().id);
         drop(active);
@@ -683,4 +939,39 @@ pub async fn stats(ctx: CustomContext<'_>) -> Result<(), Error> {
         "No completed turns yet, so processing times are not available.".to_owned()
     };
     private(&ctx, &format!("This month: {sessions} sessions, {requests} AI requests, {completed} completed.\n{timing} Audio and transcripts are not stored in usage analytics.")).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_controls_are_dm_only_and_bounded_to_known_subcommands() {
+        let command = voiceadmin();
+        assert!(command.dm_only);
+        assert!(command.subcommand_required);
+        let names: Vec<_> = command
+            .subcommands
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(names, ["kill", "resume", "approve", "revoke", "status"]);
+        assert!(command.subcommands.iter().all(|item| item.dm_only));
+        assert!(guild_id("not-an-id").is_err());
+        assert_eq!(
+            guild_id("1554320480478167050").unwrap().get(),
+            1554320480478167050
+        );
+    }
+
+    #[test]
+    fn voice_model_unload_check_requires_valid_ollama_status() {
+        let loaded = serde_json::json!({"models": [{"name": "qwen3.5:4b"}]});
+        assert_eq!(voice_model_loaded(&loaded, "qwen3.5:4b"), Some(true));
+        assert_eq!(voice_model_loaded(&loaded, "other:latest"), Some(false));
+        assert_eq!(
+            voice_model_loaded(&serde_json::json!({}), "qwen3.5:4b"),
+            None
+        );
+    }
 }
