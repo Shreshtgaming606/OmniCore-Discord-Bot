@@ -6,7 +6,9 @@ use mongodb::{
     bson::{DateTime, Document, doc},
     options::IndexOptions,
 };
-use poise::serenity_prelude::{self as serenity, ChannelId, GuildId, MessageId, UserId};
+use poise::serenity_prelude::{
+    self as serenity, ChannelId, Colour, CreateEmbed, EditMessage, GuildId, MessageId, UserId,
+};
 use serde::{Deserialize, Serialize};
 use songbird::Songbird;
 use std::{
@@ -19,7 +21,10 @@ use tokio::sync::Mutex;
 pub mod audio;
 pub mod pipeline;
 pub mod policy;
+pub mod resources;
 pub const VOICE_USAGE: &str = "voice_usage";
+const MAX_IDLE_MINUTES: u32 = 2;
+const EMPTY_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub fn retention_date() -> DateTime {
     DateTime::from_millis(DateTime::now().timestamp_millis() + 90 * 86_400_000)
@@ -89,7 +94,7 @@ impl Default for VoiceSettings {
             speaking_voice: "en_US-lessac-medium".to_owned(),
             wake_phrase: "Hey OmniCore".to_owned(),
             followup_seconds: 20,
-            idle_minutes: 10,
+            idle_minutes: MAX_IDLE_MINUTES,
             max_spoken_words: 80,
             daily_requests: 30,
             allowed_voice_channel: None,
@@ -100,15 +105,23 @@ impl Default for VoiceSettings {
 }
 
 impl VoiceSettings {
+    fn normalized(mut self) -> Self {
+        self.idle_minutes = self.idle_minutes.clamp(1, MAX_IDLE_MINUTES);
+        self
+    }
+
     pub async fn load(guild: GuildId) -> mongodb::error::Result<Self> {
         let stored = database::get_collection(GUILD_SETTINGS)?
             .find_one(doc! { "guild_id": guild.to_string() })
             .await?;
-        Ok(stored
+        let settings: Self = stored
             .as_ref()
             .and_then(|document| document.get_document("voice").ok())
             .and_then(|document| mongodb::bson::deserialize_from_document(document.clone()).ok())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        // Older guild records may still request ten or thirty minutes. Apply the
+        // new memory cap immediately without requiring a database migration.
+        Ok(settings.normalized())
     }
 
     pub async fn save(&self, guild: GuildId) -> mongodb::error::Result<()> {
@@ -153,7 +166,7 @@ impl VoiceService {
 
     fn start_housekeeping(service: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 interval.tick().await;
                 let snapshot = {
@@ -168,13 +181,10 @@ impl VoiceService {
                     session
                         .queued
                         .retain(|(_, _, queued_at)| queued_at.elapsed().as_secs() < 20);
-                    let expired = session.last_activity.elapsed()
-                        >= std::time::Duration::from_secs(
-                            u64::from(session.settings.idle_minutes) * 60,
-                        );
+                    let expired = idle_expired(session, now);
                     let alone = session
                         .empty_since
-                        .is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(60));
+                        .is_some_and(|since| now.duration_since(since) >= EMPTY_CHANNEL_TIMEOUT);
                     (session.guild, session.started, expired, alone)
                 };
                 let (guild, started, expired, alone) = snapshot;
@@ -199,15 +209,33 @@ impl VoiceService {
                     }
                 };
                 if let Some(old) = old {
-                    let _ = service.manager.remove(guild).await;
+                    let model = resources::model_for(&old.settings);
+                    if let Err(error) = service.manager.remove(guild).await {
+                        log::warn!("Voice idle disconnect failed guild={guild}: {error:?}");
+                    }
                     let reason = if disabled {
                         "server owner disabled voice"
                     } else if alone {
                         "channel empty"
                     } else {
-                        "idle timeout"
+                        "inactive for two minutes"
                     };
-                    let _ = old.text_channel.say(&service.http, format!("OmniCore Voice disconnected ({reason}). Consent and temporary context were cleared.")).await;
+                    if let Some(message) = old.status_message {
+                        let _ = old.text_channel.edit_message(&service.http, message,
+                            EditMessage::new().embed(CreateEmbed::new()
+                                .title("OmniCore Voice Assistant")
+                                .description(format!("Disconnected ({reason}). Temporary voice resources were released. Use `/voicejoin` to start again."))
+                                .colour(Colour::DARK_GREY))).await;
+                    }
+                    let _ = old.text_channel.say(&service.http, format!("OmniCore Voice disconnected ({reason}). Speech recognition and temporary context were released. Use `/voicejoin` to start again; participants must opt in again.")).await;
+                    if let Some(model) = model
+                        && !resources::unload_model(&model).await
+                    {
+                        log::warn!(
+                            "Voice idle cleanup could not confirm Ollama model unload guild={guild}"
+                        );
+                    }
+                    log::info!("Voice auto-disconnected guild={guild} reason={reason}");
                 }
             }
         });
@@ -220,8 +248,16 @@ impl VoiceService {
             return;
         };
         if new.user_id == bot && new.channel_id != Some(session.channel) {
+            let model = resources::model_for(&session.settings);
             session.stop();
             *guard = None;
+            drop(guard);
+            let _ = self.manager.remove(guild).await;
+            if let Some(model) = model
+                && !resources::unload_model(&model).await
+            {
+                log::warn!("Voice cleanup could not confirm Ollama model unload guild={guild}");
+            }
             return;
         }
         if new.user_id == bot {
@@ -240,6 +276,18 @@ impl VoiceService {
             }
         }
     }
+}
+
+fn idle_expired(session: &VoiceSession, now: Instant) -> bool {
+    !session.busy
+        && session
+            .buffers
+            .values()
+            .all(|buffer| buffer.voiced_ticks == 0)
+        && now.duration_since(session.last_activity)
+            >= std::time::Duration::from_secs(
+                u64::from(session.settings.idle_minutes.clamp(1, MAX_IDLE_MINUTES)) * 60,
+            )
 }
 
 pub struct VoiceSession {
@@ -347,7 +395,7 @@ mod tests {
         let settings = VoiceSettings::default();
         assert!(!settings.enabled);
         assert_eq!(settings.followup_seconds, 20);
-        assert_eq!(settings.idle_minutes, 10);
+        assert_eq!(settings.idle_minutes, 2);
         let mut session = VoiceSession::new(GuildId::new(1), ChannelId::new(2), ChannelId::new(3));
         session.consenting.insert(UserId::new(4));
         session.active_user = Some(UserId::new(4));
@@ -379,5 +427,37 @@ mod tests {
         assert!(session.worker.is_none());
         assert!(session.consenting.is_empty());
         assert!(session.buffers.is_empty());
+    }
+
+    #[test]
+    fn idle_cleanup_waits_two_minutes_after_the_last_finished_turn() {
+        let mut session = VoiceSession::new(GuildId::new(1), ChannelId::new(2), ChannelId::new(3));
+        session.settings.idle_minutes = 10; // Legacy server setting is capped at runtime.
+        let now = Instant::now();
+        session.last_activity = now - std::time::Duration::from_secs(119);
+        assert!(!idle_expired(&session, now));
+        session.last_activity = now - std::time::Duration::from_secs(120);
+        assert!(idle_expired(&session, now));
+        session.busy = true;
+        assert!(!idle_expired(&session, now));
+        session.busy = false;
+        let mut speaking = AudioBuffer::new();
+        speaking.voiced_ticks = 1;
+        session.buffers.insert(UserId::new(4), speaking);
+        assert!(!idle_expired(&session, now));
+    }
+
+    #[test]
+    fn older_guild_idle_settings_are_capped_without_a_migration() {
+        let settings = VoiceSettings {
+            idle_minutes: 30,
+            ..VoiceSettings::default()
+        };
+        assert_eq!(settings.normalized().idle_minutes, 2);
+        let settings = VoiceSettings {
+            idle_minutes: 0,
+            ..VoiceSettings::default()
+        };
+        assert_eq!(settings.normalized().idle_minutes, 1);
     }
 }

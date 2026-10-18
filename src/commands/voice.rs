@@ -40,16 +40,7 @@ async fn disconnect_active(service: &crate::voice::VoiceService, reason: &str) -
     };
     let old = old?;
     let guild = old.guild;
-    let model = (old.settings.provider == "ollama").then(|| {
-        if old.settings.model.is_empty() {
-            crate::config::OLLAMA_MODEL
-                .get()
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            old.settings.model.clone()
-        }
-    });
+    let model = crate::voice::resources::model_for(&old.settings);
     let _ = service.manager.remove(guild).await;
     if let Some(message) = old.status_message {
         let _ = old
@@ -70,79 +61,13 @@ async fn disconnect_active(service: &crate::voice::VoiceService, reason: &str) -
     model
 }
 
-fn voice_model_loaded(body: &serde_json::Value, model: &str) -> Option<bool> {
-    let models = body.get("models")?.as_array()?;
-    Some(models.iter().any(|entry| {
-        entry
-            .get("name")
-            .or_else(|| entry.get("model"))
-            .and_then(serde_json::Value::as_str)
-            == Some(model)
-    }))
-}
-
-async fn unload_voice_model(model: &str) -> bool {
-    if model.is_empty() {
-        return true;
-    }
-    let Some(base) = crate::config::OLLAMA_BASE_URL.get() else {
-        return false;
-    };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    let ps_url = format!("{base}/api/ps");
-    let Ok(response) = client.get(&ps_url).send().await else {
-        return false;
-    };
-    let Ok(body) = response.json::<serde_json::Value>().await else {
-        return false;
-    };
-    let Some(loaded) = voice_model_loaded(&body, model) else {
-        return false;
-    };
-    if !loaded {
-        return true;
-    }
-    let Ok(response) = client
-        .post(format!("{base}/api/generate"))
-        .json(&serde_json::json!({"model": model, "prompt": "", "stream": false, "keep_alive": 0}))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-    for _ in 0..5 {
-        let Ok(response) = client.get(&ps_url).send().await else {
-            return false;
-        };
-        let Ok(body) = response.json::<serde_json::Value>().await else {
-            return false;
-        };
-        let Some(loaded) = voice_model_loaded(&body, model) else {
-            return false;
-        };
-        if !loaded {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    false
-}
-
 /// Stop all voice use and free the active local voice models (bot owners, DM only).
 #[poise::command(slash_command, dm_only)]
 pub async fn kill(ctx: CustomContext<'_>) -> Result<(), Error> {
     if !bot_owner(&ctx) {
         return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
     }
+    ctx.defer_ephemeral().await?;
     ctx.data().voice.killed.store(true, Ordering::SeqCst);
     let model = disconnect_active(
         &ctx.data().voice,
@@ -151,7 +76,7 @@ pub async fn kill(ctx: CustomContext<'_>) -> Result<(), Error> {
     .await;
     crate::voice::policy::set_killed(true).await?;
     let unloaded = match model {
-        Some(model) => unload_voice_model(&model).await,
+        Some(model) => crate::voice::resources::unload_model(&model).await,
         None => true,
     };
     let memory = if unloaded {
@@ -194,6 +119,7 @@ pub async fn approve(
     if !bot_owner(&ctx) {
         return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
     }
+    ctx.defer_ephemeral().await?;
     let guild = guild_id(&server_id)?;
     if guild.to_partial_guild(ctx.http()).await.is_err() {
         return private(&ctx, "OmniCore is not in that server or cannot access it.").await;
@@ -212,6 +138,7 @@ pub async fn revoke(
     if !bot_owner(&ctx) {
         return private(&ctx, "Only OmniCore bot owners can use this in my DMs.").await;
     }
+    ctx.defer_ephemeral().await?;
     let guild = guild_id(&server_id)?;
     if crate::voice::policy::builtin(guild) {
         return private(&ctx, "This is one of the three built-in voice servers. Use `/voiceadmin kill` to stop all voice use.").await;
@@ -227,11 +154,14 @@ pub async fn revoke(
         .as_ref()
         .is_some_and(|s| s.guild == guild);
     if active {
-        let _ = disconnect_active(
+        let model = disconnect_active(
             &ctx.data().voice,
             "Voice access was revoked by an OmniCore bot owner.",
         )
         .await;
+        if let Some(model) = model {
+            let _ = crate::voice::resources::unload_model(&model).await;
+        }
     }
     private(&ctx, &format!("Voice approval revoked for server {guild}.")).await
 }
@@ -293,7 +223,7 @@ fn notice(channel: serenity::ChannelId, settings: &VoiceSettings, count: usize) 
         .field("Speaking voice", &settings.speaking_voice, true)
         .field("Opted-in participants", count.to_string(), true)
         .field("Status", if count == 0 { "Waiting for consent" } else { "Ready" }, true)
-        .description("Voice processing is opt-in. After you consent, speak normally; no wake phrase is needed. Recognized speech and OmniCore's text response are posted in this text channel. Speech recognition and speaking voice run locally; the selected AI provider may receive transcribed questions. Use `/voice consent enabled:false` to opt out or `/voiceleave` to disconnect.")
+        .description("Voice processing is opt-in. After you consent, speak normally; no wake phrase is needed. Recognized speech and OmniCore's text response are posted in this text channel. The session disconnects after about two minutes without voice use, releases local voice resources, and can be restarted with `/voicejoin`. Use `/voice consent enabled:false` to opt out or `/voiceleave` to disconnect.")
 }
 
 async fn refresh_notice(service: &crate::voice::VoiceService, guild: serenity::GuildId) {
@@ -610,6 +540,7 @@ pub async fn voiceleave(ctx: CustomContext<'_>) -> Result<(), Error> {
     let guild = ctx.guild_id().ok_or("Server required")?;
     let owner = is_guild_owner(&ctx).await?;
     let bot_owner = ctx.framework().options().owners.contains(&ctx.author().id);
+    ctx.defer_ephemeral().await?;
     let mut active = ctx.data().voice.active.lock().await;
     let Some(session) = active.as_mut().filter(|session| session.guild == guild) else {
         return private(&ctx, "OmniCore has no voice session in this server.").await;
@@ -621,16 +552,19 @@ pub async fn voiceleave(ctx: CustomContext<'_>) -> Result<(), Error> {
         )
         .await;
     }
+    let model = crate::voice::resources::model_for(&session.settings);
     session.stop();
     let started = session.started;
     let status = session
         .status_message
         .map(|message| (session.text_channel, message));
     drop(active);
-    if let Err(error) = ctx.data().voice.manager.remove(guild).await {
+    let removal_failed = if let Err(error) = ctx.data().voice.manager.remove(guild).await {
         log::warn!("Voice leave failed guild={guild}: {error:?}");
-        return private(&ctx, "Voice processing stopped, but Discord did not confirm disconnection. Please retry `/voiceleave`.").await;
-    }
+        true
+    } else {
+        false
+    };
     {
         let mut active = ctx.data().voice.active.lock().await;
         if active
@@ -639,6 +573,11 @@ pub async fn voiceleave(ctx: CustomContext<'_>) -> Result<(), Error> {
         {
             *active = None;
         }
+    }
+    if let Some(model) = model
+        && !crate::voice::resources::unload_model(&model).await
+    {
+        log::warn!("Voice model unload could not be confirmed after /voiceleave guild={guild}");
     }
     if let Some((text, message)) = status {
         let _ = text
@@ -654,11 +593,15 @@ pub async fn voiceleave(ctx: CustomContext<'_>) -> Result<(), Error> {
             )
             .await;
     }
-    private(
-        &ctx,
-        "Disconnected from voice. Consent and temporary session context were cleared.",
-    )
-    .await
+    if removal_failed {
+        private(&ctx, "Voice processing and local resources stopped, but Discord did not confirm disconnection. Please retry `/voiceleave`.").await
+    } else {
+        private(
+            &ctx,
+            "Disconnected from voice. Consent and temporary session context were cleared.",
+        )
+        .await
+    }
 }
 
 /// Show the current voice session without revealing private speech.
@@ -683,7 +626,7 @@ pub async fn settings(
     #[description = "Local Ollama model; cloud models use /ai model"] model: Option<String>,
     #[description = "Local speaking voice"] speaking_voice: Option<String>,
     #[description = "Follow-up window, 5–60 seconds"] followup_seconds: Option<u32>,
-    #[description = "Idle disconnect, 1–30 minutes"] idle_minutes: Option<u32>,
+    #[description = "Idle disconnect, 1–2 minutes"] idle_minutes: Option<u32>,
     #[description = "Maximum spoken answer, 20–150 words"] max_spoken_words: Option<u32>,
     #[description = "Daily voice AI requests, 1–200"] daily_requests: Option<u32>,
     #[description = "Restrict voice to this channel"] allowed_voice_channel: Option<
@@ -694,6 +637,7 @@ pub async fn settings(
     if !is_guild_owner(&ctx).await? {
         return private(&ctx, "Only this server's owner can change voice settings.").await;
     }
+    ctx.defer_ephemeral().await?;
     let guild = ctx.guild_id().ok_or("Server required")?;
     let mut current = VoiceSettings::load(guild).await?;
     let changed = enabled.is_some()
@@ -755,8 +699,8 @@ pub async fn settings(
         current.followup_seconds = value;
     }
     if let Some(value) = idle_minutes {
-        if !(1..=30).contains(&value) {
-            return private(&ctx, "Idle disconnect must be 1–30 minutes.").await;
+        if !(1..=2).contains(&value) {
+            return private(&ctx, "Idle disconnect must be 1–2 minutes.").await;
         }
         current.idle_minutes = value;
     }
@@ -786,14 +730,18 @@ pub async fn settings(
         if !current.enabled {
             let mut guard = ctx.data().voice.active.lock().await;
             if let Some(session) = guard.as_mut().filter(|s| s.guild == guild) {
+                let model = crate::voice::resources::model_for(&session.settings);
                 session.stop();
                 *guard = None;
                 drop(guard);
                 let _ = ctx.data().voice.manager.remove(guild).await;
+                if let Some(model) = model {
+                    let _ = crate::voice::resources::unload_model(&model).await;
+                }
             }
         }
     }
-    private(&ctx, &format!("Voice: {}\nAI provider: {}\nModel: {}\nSpeaking voice: {}\nWake phrase: none\nFollow-ups: {} seconds\nIdle disconnect: {} minutes\nMaximum spoken answer: {} words\nDaily request limit: {}\nAllowed voice channel: {}\nAllowed role: {}\nSpeech recognition and TTS: local\nConsent: required for every participant; transcripts and text responses appear in the voice session's text channel.\nCloud AI may incur provider charges when selected.", if current.enabled { "Enabled" } else { "Disabled" }, current.provider, if current.model.is_empty() { "Existing selected model" } else { &current.model }, current.speaking_voice, current.followup_seconds, current.idle_minutes, current.max_spoken_words, current.daily_requests, current.allowed_voice_channel.map_or("Any".to_owned(), |id| format!("<#{id}>")), current.allowed_role.map_or("Any".to_owned(), |id| format!("<@&{id}>")))).await
+    private(&ctx, &format!("Voice: {}\nAI provider: {}\nModel: {}\nSpeaking voice: {}\nWake phrase: none\nFollow-ups: {} seconds\nIdle disconnect: {} minutes\nMaximum spoken answer: {} words\nDaily request limit: {}\nAllowed voice channel: {}\nAllowed role: {}\nLocal Ollama thinking: set with `/ai thinking` (shared with text mentions)\nSpeech recognition and TTS: local\nConsent: required for every participant; transcripts and text responses appear in the voice session's text channel.\nCloud AI may incur provider charges when selected.", if current.enabled { "Enabled" } else { "Disabled" }, current.provider, if current.model.is_empty() { "Existing selected model" } else { &current.model }, current.speaking_voice, current.followup_seconds, current.idle_minutes, current.max_spoken_words, current.daily_requests, current.allowed_voice_channel.map_or("Any".to_owned(), |id| format!("<#{id}>")), current.allowed_role.map_or("Any".to_owned(), |id| format!("<@&{id}>")))).await
 }
 
 /// Opt into or out of voice processing for the active session.
@@ -825,9 +773,10 @@ pub async fn consent(
             }
         }
         session.consenting.insert(ctx.author().id);
+        session.last_activity = std::time::Instant::now();
         drop(active);
         refresh_notice(&ctx.data().voice, guild).await;
-        private(&ctx, "You opted in for this voice session. Speak normally; no wake phrase is needed. Your recognized speech and OmniCore's text responses will appear in the text channel where `/voicejoin` was run. Use `/voice consent enabled:false` to opt out immediately.").await
+        private(&ctx, "You opted in for this voice session. Speak normally; no wake phrase is needed. Your recognized speech and OmniCore's text responses will appear in the text channel where `/voicejoin` was run. After about two minutes without use, the session disconnects; use `/voicejoin` and opt in again. Use `/voice consent enabled:false` to opt out immediately.").await
     } else {
         session.revoke(ctx.author().id);
         drop(active);
@@ -848,6 +797,7 @@ pub async fn stop(ctx: CustomContext<'_>) -> Result<(), Error> {
         return private(&ctx, "Join the active voice channel to stop playback.").await;
     }
     session.interrupt();
+    session.last_activity = std::time::Instant::now();
     private(&ctx, "Voice response stopped.").await
 }
 
@@ -895,6 +845,7 @@ pub async fn test(ctx: CustomContext<'_>) -> Result<(), Error> {
     {
         s.interrupt();
         s.track = Some(track);
+        s.last_activity = std::time::Instant::now();
     } else {
         let _ = track.stop();
     }
@@ -961,17 +912,6 @@ mod tests {
         assert_eq!(
             guild_id("1554320480478167050").unwrap().get(),
             1554320480478167050
-        );
-    }
-
-    #[test]
-    fn voice_model_unload_check_requires_valid_ollama_status() {
-        let loaded = serde_json::json!({"models": [{"name": "qwen3.5:4b"}]});
-        assert_eq!(voice_model_loaded(&loaded, "qwen3.5:4b"), Some(true));
-        assert_eq!(voice_model_loaded(&loaded, "other:latest"), Some(false));
-        assert_eq!(
-            voice_model_loaded(&serde_json::json!({}), "qwen3.5:4b"),
-            None
         );
     }
 }

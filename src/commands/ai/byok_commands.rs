@@ -1,3 +1,4 @@
+use super::thinking::thinking;
 use crate::{
     CustomContext, Error,
     byok::{
@@ -30,6 +31,7 @@ use std::sync::Arc;
         "channel",
         "role",
         "vision",
+        "thinking",
         "disconnect"
     ),
     subcommand_required,
@@ -116,12 +118,19 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         return Ok(());
     }
     let guild = ctx.guild_id().ok_or("Guild required")?.get();
+    let local_thinking = super::thinking::enabled(serenity::GuildId::new(guild))
+        .await
+        .map_err(|_| "AI thinking setting unavailable")?;
     let approved = database::is_ai_approved(guild)
         .await
         .map_err(|_| "AI approval status unavailable")?;
     let Some(service) = service(&ctx) else {
         return respond(&ctx, if approved {
-            "This server is approved for local Ollama AI, including image recognition. A provider key is not needed for server messages."
+            if local_thinking {
+                "This server is approved for local Ollama AI, including image recognition. Thinking is enabled for text and voice. Use /ai thinking to change it."
+            } else {
+                "This server is approved for local Ollama AI, including image recognition. Thinking is disabled for text and voice. Use /ai thinking to change it."
+            }
         } else {
             "This server is not approved for local AI, and secure provider setup is unavailable right now. Ask the bot operators to check the setup service."
         }).await;
@@ -132,7 +141,11 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         .map_err(|_| "AI settings unavailable")?;
     let Some(connection) = connection else {
         return respond(&ctx, if approved {
-            "This server is approved for local Ollama AI, including image recognition. A provider key is not needed for server messages. /ai setup is optional for owner DM vision."
+            if local_thinking {
+                "This server is approved for local Ollama AI, including image recognition. Thinking is enabled for text and voice. /ai setup is optional for owner DM vision."
+            } else {
+                "This server is approved for local Ollama AI, including image recognition. Thinking is disabled for text and voice. /ai setup is optional for owner DM vision."
+            }
         } else {
             "This server is not approved for local AI and no provider is connected. The server owner can run /ai setup, or ask the bot owners to approve the server."
         }).await;
@@ -161,6 +174,15 @@ pub async fn status(ctx: CustomContext<'_>) -> Result<(), Error> {
         )
         .field("Provider", connection.provider.name(), true)
         .field("Model", connection.model.clone(), true)
+        .field(
+            "Local Ollama thinking",
+            if local_thinking {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+            true,
+        )
         .field(
             "Vision",
             format!(

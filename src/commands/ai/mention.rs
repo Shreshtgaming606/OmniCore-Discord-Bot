@@ -7,12 +7,11 @@ use crate::{Data, Error};
 use chrono::Utc;
 use mongodb::bson::Bson;
 use mongodb::bson::doc;
-use ollama_rs::generation::chat::{ChatMessage, MessageRole, request::ChatMessageRequest};
+use ollama_rs::generation::chat::{ChatMessage, MessageRole};
 use ollama_rs::generation::tools::Tool;
 use ollama_rs::models::ModelOptions;
 use poise::serenity_prelude as serenity;
 use poise::serenity_prelude::Context;
-use serde_json::Value;
 
 /// Max amount of chars per message, as defined in Discord API docs.
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
@@ -248,15 +247,14 @@ pub(crate) async fn on_mention(
     let mut final_res = None;
 
     for hop in 0..=MAX_TOOL_HOPS {
-        let request = ChatMessageRequest::new(model.clone(), next_turns.clone())
-            .options(
-                ModelOptions::default()
-                    .num_ctx(16384)
-                    .num_predict(-1)
-                    .extra("think", Value::Bool(false)),
-            )
-            .add_tool(Wikipedia::new())
-            .add_tool(WikipediaSearch::new());
+        let request = super::thinking::local_request(
+            model.clone(),
+            next_turns.clone(),
+            ModelOptions::default().num_ctx(16384).num_predict(-1),
+            guild_settings.get_bool("ai_thinking").unwrap_or(false),
+        )
+        .add_tool(Wikipedia::new())
+        .add_tool(WikipediaSearch::new());
 
         let res = ollama
             .send_chat_messages_with_history(&mut chat_history, request)

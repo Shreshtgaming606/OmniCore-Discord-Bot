@@ -4,8 +4,7 @@ use super::{AudioBuffer, Conversation, VoiceService, VoiceSession, audio};
 use crate::{OLLAMA, config, database};
 use mongodb::bson::doc;
 use ollama_rs::{
-    generation::chat::MessageRole,
-    generation::chat::{ChatMessage, request::ChatMessageRequest},
+    generation::chat::{ChatMessage, MessageRole},
     models::ModelOptions,
 };
 use opus2::{Channels, Decoder};
@@ -35,11 +34,21 @@ impl EventHandler for Receiver {
         let mut guard = self.service.active.lock().await;
         if matches!(event, EventContext::DriverDisconnect(_)) {
             if let Some(session) = guard.as_mut().filter(|s| s.guild == self.guild) {
+                let model = super::resources::model_for(&session.settings);
                 session.stop();
                 let channel = session.text_channel;
                 *guard = None;
                 let service = self.service.clone();
+                let guild = self.guild;
                 tokio::spawn(async move {
+                    let _ = service.manager.remove(guild).await;
+                    if let Some(model) = model
+                        && !super::resources::unload_model(&model).await
+                    {
+                        log::warn!(
+                            "Voice disconnect could not confirm Ollama model unload guild={guild}"
+                        );
+                    }
                     notice(&service, channel, "OmniCore Voice disconnected unexpectedly. Consent and temporary context were cleared; use `/voicejoin` to try again.").await;
                 });
             }
@@ -260,7 +269,7 @@ async fn process_utterance(
             &service.http,
             CreateMessage::new()
                 .content(format!(
-                    "🎙️ <@{user}>: {transcript_text}\n⏳ OmniCore is thinking…"
+                    "🎙️ <@{user}>: {transcript_text}\n⏳ OmniCore is preparing a reply…"
                 ))
                 .allowed_mentions(no_mentions()),
         )
@@ -280,7 +289,7 @@ async fn process_utterance(
     }
     let ai_start = Instant::now();
     let response = if settings.provider == "ollama" {
-        local_answer(&settings, &context, &question).await
+        local_answer(guild, &settings, &context, &question).await
     } else {
         cloud_answer(&service, guild, user, channel.get(), &context, &question).await
     };
@@ -435,6 +444,7 @@ async fn finish(
         } else {
             s.busy = false;
             s.worker = None;
+            s.last_activity = Instant::now();
             None
         }
     }
@@ -468,6 +478,7 @@ async fn reserve_request(guild: GuildId, daily: u32) -> bool {
 }
 
 async fn local_answer(
+    guild: GuildId,
     settings: &super::VoiceSettings,
     context: &[(String, String)],
     question: &str,
@@ -486,9 +497,19 @@ async fn local_answer(
         messages.push(ChatMessage::new(MessageRole::Assistant, assistant.clone()));
     }
     messages.push(ChatMessage::user(question.to_owned()));
-    let request = ChatMessageRequest::new(model.clone(), messages)
-        .options(ModelOptions::default().num_ctx(2048).num_predict(240))
-        .think(false);
+    let thinking = match crate::commands::ai::thinking::enabled(guild).await {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            log::warn!("Could not load AI thinking setting guild={guild}: {error}");
+            false
+        }
+    };
+    let request = crate::commands::ai::thinking::local_request(
+        model.clone(),
+        messages,
+        ModelOptions::default().num_ctx(2048).num_predict(240),
+        thinking,
+    );
     let result = tokio::time::timeout(Duration::from_secs(45), client.send_chat_messages(request))
         .await
         .map_err(|_| "Ollama timed out")?
@@ -602,6 +623,7 @@ mod tests {
         let mut session = VoiceSession::new(guild, ChannelId::new(902), ChannelId::new(903));
         let started = session.started;
         session.busy = true;
+        session.last_activity = Instant::now() - Duration::from_secs(180);
         session.active_user = Some(UserId::new(1));
         session.consenting.insert(UserId::new(1));
         session.consenting.insert(UserId::new(2));
@@ -629,6 +651,13 @@ mod tests {
         assert!(session.busy);
         assert_eq!(session.active_user, Some(UserId::new(3)));
         assert!(session.queued.is_empty());
+        assert!(session.last_activity.elapsed() < Duration::from_secs(2));
+        drop(guard);
+        assert_eq!(finish(&service, guild, started, 0).await, None);
+        let guard = service.active.lock().await;
+        let session = guard.as_ref().unwrap();
+        assert!(!session.busy);
+        assert!(session.last_activity.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
