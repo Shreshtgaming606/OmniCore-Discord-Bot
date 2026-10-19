@@ -1,33 +1,31 @@
-# OmniCore BYOK operations
+# Secure server-owned AI setup
 
-OmniCore remains a Rust bot. The optional provider integration uses the official OpenAI Responses, Anthropic Messages, and Gemini Generate Content APIs. The existing local Ollama paths for AutoMod and approved legacy assistant use are separate. Guild API keys are never submitted through Discord.
+OmniCore's optional provider path uses OpenAI Responses, Anthropic Messages, and Gemini Generate Content APIs. Each guild owner supplies their own API key through the Rust HTTPS pairing portal; keys are never accepted in Discord chat. Provider use may incur charges on that owner's account.
 
-## Required private runtime settings
+## Private runtime settings
 
-Add these names to the existing mode-`0600` `.env.runtime` on the bot host and pass that file to `docker run --env-file`:
+Set these values in an ignored `.env` or secret manager:
 
 ```dotenv
-OMNICORE_OWNER_1_ID=1109540816013234256
-OMNICORE_OWNER_2_ID=1157083515486220429
-OMNICORE_BYOK_MASTER_KEY_HEX=<one stable 64-character hex value, generated with openssl rand -hex 32>
-OMNICORE_DISCORD_CLIENT_ID=1521673931134603304
-OMNICORE_DISCORD_CLIENT_SECRET=<Discord Developer Portal OAuth2 client secret>
+OMNICORE_OWNER_IDS=<numeric Discord operator ID, or comma-separated IDs>
+OMNICORE_BYOK_MASTER_KEY_HEX=<stable 64-character hex value>
+OMNICORE_DISCORD_CLIENT_ID=<your Discord application ID>
+OMNICORE_DISCORD_CLIENT_SECRET=<your Discord OAuth client secret>
+OMNICORE_PUBLIC_BASE_URL=https://your-domain.example
 ```
 
-Do not add actual secrets to `.env.example`, source control, logs, or chat. Losing the master key makes stored provider credentials unreadable; keep a protected copy with the production runtime configuration. Rotating it requires a deliberate migration that decrypts with the old key and re-encrypts each credential with the new key. Records contain a key version field for that future migration.
+Generate the master key privately with `openssl rand -hex 32` and keep an encrypted backup. Losing it makes stored provider keys unreadable. Rotating it requires a deliberate re-encryption migration; changing the variable alone will break existing connections. Existing installations may use `OMNICORE_OWNER_1_ID` and `OMNICORE_OWNER_2_ID` instead of `OMNICORE_OWNER_IDS`.
 
-Register the exact Discord OAuth2 redirect `https://discordbot.omnicoretech.org/connect/callback` for OmniCore's application. The bot starts its Rust portal on Docker-internal port 8098 only when both its master key and OAuth settings are present. The site Nginx container must share `omnicore-network` and reverse proxy `/connect/` to `http://omnicore-discord-bot:8098`, with access logging disabled for that path. The public Cloudflare endpoint must remain HTTPS.
+Register exactly `https://your-domain.example/connect/callback` in your application's Discord OAuth2 redirects. Proxy `/connect/` to bot port 8098 on a private network; terminate TLS at the proxy. The portal starts only when the master key, client ID, client secret, and valid `OMNICORE_PUBLIC_BASE_URL` are configured. Do not expose plain HTTP port 8098 publicly. The bundled `deploy/nginx/` files describe the official site's deployment and need adaptation for another domain/network.
 
-## Pairing and use
+## Pairing and permissions
 
-The current guild owner runs `/ai setup` and receives an ephemeral link valid for ten minutes. The portal uses Discord OAuth2 authorization code flow, state, PKCE S256, secure cookies, CSRF tokens, and a fresh bot-API guild ownership check. The owner validates a provider key, chooses a model reported by that provider, and connects it. The key is encrypted with AES-256-GCM and random nonce before MongoDB storage. The session and unpaired key stay in process memory only and expire or disappear on restart.
+The current guild owner runs `/ai setup` and receives a short-lived link. The portal uses Discord OAuth2 authorization code flow, PKCE S256, state, secure session cookies, CSRF protection, and a fresh guild ownership check. The owner validates a provider key and chooses a model returned by that provider. AES-256-GCM encrypts the key before MongoDB storage. Unpaired keys and sessions remain only in process memory and expire or disappear on restart.
 
-An authorized member can use `/ask` or mention OmniCore in a configured channel. `/ai limits`, `/ai channel`, and `/ai role` control use. Each accepted request atomically reserves a daily per-guild and per-member slot before contacting the provider. A single DM warns the owner when the guild reaches at least 80% of its daily request limit. Request quotas are not a precise spending cap. `/ai usage` shows provider request and token metadata without prompts or estimated cost. `/ai disconnect` removes the stored key; owners should revoke it at the provider if needed.
+Owners can manage access with `/ai status`, `/ai model`, `/ai limits`, `/ai channel`, `/ai role`, `/ai vision`, `/ai thinking`, and `/ai disconnect`. Members use `/ask` where allowed. Request quotas are usage controls, not precise spending caps. `/ai usage` records counts and provider token metadata without prompts or image data. Disconnecting removes the stored key; revoke it at the provider too if compromise is suspected.
 
-## Moderation data
+AutoMod uses the configured local Ollama classifier, not a guild's cloud key. Local bot-approved chat and vision are separate from server-owned provider billing. The owner can enable voice provider use within their existing AI limits.
 
-The AutoMod action path publishes an event only after a warning was actually delivered or Discord confirmed a timeout. Failed timeout attempts are separate. Events have no raw message body. One outbox record per incident/recipient deduplicates alerts to the two developers and current guild owner. Owner messages include the affected member and channel. Developer messages omit member details and raw content. `/automod diagnostics` disables operator diagnostic alerts per guild. Owner DM failure falls back only to a configured channel with an explicit `@everyone` view deny. Metadata and delivery records have 90-day TTL indexes. Raw AutoMod incident context remains capped at sixty seconds by the existing incident path.
+## Operations
 
-## Rollback
-
-Save the previous source, site, Nginx configuration, Compose override, and image tag before replacement. Revert the site and proxy first, then restore the previous container image with its original environment if the new process fails health checks. Do not delete the MongoDB records created during rollback; old code ignores the new collections and the TTL indexes expire their metadata. Reverting the bot does not undo Discord actions already applied.
+Back up the private runtime configuration and MongoDB securely. Do not put keys in Git, issues, logs, or chat. Retain the master key across restarts. Review `/ai usage` and provider-side billing. On rollback, restore a compatible image and runtime variables; do not delete MongoDB collections blindly. [Retention details](RETENTION.md) describe safe legacy migration and deletion.

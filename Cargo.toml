@@ -2,6 +2,8 @@
 name = "omnicore_bot"
 version = "1.0.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Shreshtgaming606/OmniCore-Discord-Bot"
 
 [dependencies]
 log = "0.4.33"

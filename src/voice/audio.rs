@@ -7,7 +7,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub fn model_root() -> PathBuf {
     std::env::var_os("OMNICORE_VOICE_MODEL_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/voice-models"))
+        .unwrap_or_else(|| PathBuf::from("voice-models"))
 }
 
 pub fn check_models(voice: &str) -> Result<(), String> {

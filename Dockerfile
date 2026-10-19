@@ -17,12 +17,7 @@ RUN apt-get update && \
     pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
-RUN rustup component add rustfmt
-
-ENV CFLAGS="-march=armv8.2-a+fp16"
-ENV CXXFLAGS="-march=armv8.2-a+fp16"
 ENV GGML_NATIVE=OFF
-ENV GGML_CPU_ARM_ARCH=armv8.2-a+fp16
 
 COPY Cargo.toml Cargo.lock ./
 
@@ -40,9 +35,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/local/bin
+RUN groupadd --system --gid 10001 omnicore && \
+    useradd --system --uid 10001 --gid 10001 --no-create-home omnicore
+
+WORKDIR /app
 
 COPY --from=builder /usr/src/app/target/release/omnicore_bot .
 COPY --from=builder /usr/src/app/target/release/retention_audit /usr/src/app/target/release/retention_migrate ./
 
+USER omnicore:omnicore
 CMD ["./omnicore_bot"]

@@ -1,14 +1,3 @@
 # Roadmap
 
-1. [ ] TTS and VTT so the AI can join VCs
-   - [ ] Implement Text-to-Speech (TTS) functionality for generating audio from text.
-   - [ ] Implement Voice-to-Text (VTT) functionality for transcribing audio to text.
-2. [x] Ability to timeout users that are breaking the rules.
-3. [ ] Ability to search the web, get recent messages in the channel, get information and content about a user and message ID.
-4. [ ] Invite Tree, shows the tree of people inviting people to the server.
-5. [ ] Logging Module
-6. [ ] Ability to enable/disable certain modules
-7. [ ] A web interface for configuring the bot
-   - [ ] Will allow users that have the MANAGE_SERVER permission to configure the bot.
-   - [ ] Will login by DMing the user a magic link.
-8. [ ] Batch scan messages with AI.
+OmniCore already has opt-in voice transcription and speech, AutoMod timeouts, image recognition, image generation, provider pairing, and retention controls. Open proposals belong in GitHub Issues. Potential areas for future work include stronger self-hosting diagnostics, more provider mocks, and easier local model setup. Features listed here are proposals, not commitments.

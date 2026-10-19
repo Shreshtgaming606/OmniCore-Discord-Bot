@@ -1,21 +1,16 @@
 //! Bot-owner voice access and persistent emergency stop.
 
-use crate::database;
+use crate::{config, database};
 use mongodb::bson::doc;
 use poise::serenity_prelude::GuildId;
 
 const ACCESS: &str = "voice_access";
 const CONTROL: &str = "voice_control";
 
-// Official Scoggins MS (SMS), Minecraft Server, OmniCore Technologies.
-pub const BUILTIN_GUILDS: [u64; 3] = [
-    1370968847577780296,
-    1485752556981453053,
-    1554320480478167050,
-];
-
 pub fn builtin(guild: GuildId) -> bool {
-    BUILTIN_GUILDS.contains(&guild.get())
+    config::VOICE_BUILTIN_GUILDS
+        .get()
+        .is_some_and(|guilds| guilds.contains(&guild.get()))
 }
 
 pub async fn allowed(guild: GuildId) -> mongodb::error::Result<bool> {
@@ -72,13 +67,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_three_named_servers_have_builtin_voice_access() {
-        assert_eq!(BUILTIN_GUILDS.len(), 3);
-        for id in BUILTIN_GUILDS {
-            assert!(builtin(GuildId::new(id)));
-        }
-        assert!(!builtin(GuildId::new(1547715641501290566))); // SMS NJHS is a separate server.
-        assert!(!builtin(GuildId::new(1375850064110551090))); // SMS Orchestra is a separate server.
+    fn guild_without_configured_access_is_not_builtin() {
         assert!(!builtin(GuildId::new(123)));
     }
 }

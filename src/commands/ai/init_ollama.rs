@@ -4,6 +4,11 @@ use ollama_rs::Ollama;
 use reqwest::Client;
 
 pub(crate) async fn init_ollama() {
+    let ollama_model = OLLAMA_MODEL.get().unwrap();
+    if ollama_model.is_empty() {
+        log::info!("No local Ollama model configured; local AI features are unavailable");
+        return;
+    }
     // First ping the Ollama server to make sure it's up and running
     let client = Client::new();
 
@@ -26,8 +31,6 @@ pub(crate) async fn init_ollama() {
     };
 
     // List models and validate that the chosen model actually exists
-    let ollama_model = OLLAMA_MODEL.get().unwrap();
-
     let models = match ollama.list_local_models().await {
         Ok(models) => models,
         Err(error) => {

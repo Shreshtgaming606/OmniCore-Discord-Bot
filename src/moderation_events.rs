@@ -95,13 +95,17 @@ fn event_document(event: &ModerationEvent) -> Document {
 /// The developer list is independent of legacy BOT_OWNERS. One delivery document
 /// per (incident, recipient) prevents fan-out duplication when a developer owns a guild.
 fn recipients(event: &ModerationEvent, settings: &AutoModConfig) -> BTreeMap<u64, (bool, bool)> {
-    recipients_with_developers(event, settings, config::DEVELOPER_IDS.get())
+    recipients_with_developers(
+        event,
+        settings,
+        config::DEVELOPER_IDS.get().map(Vec::as_slice),
+    )
 }
 
 fn recipients_with_developers(
     event: &ModerationEvent,
     settings: &AutoModConfig,
-    developers: Option<&[u64; 2]>,
+    developers: Option<&[u64]>,
 ) -> BTreeMap<u64, (bool, bool)> {
     let mut recipients = BTreeMap::new();
     if settings.notify_owner {

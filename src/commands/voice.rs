@@ -180,8 +180,22 @@ pub async fn admin_status(ctx: CustomContext<'_>) -> Result<(), Error> {
         .await
         .as_ref()
         .map(|s| s.guild.to_string());
-    private(&ctx, &format!("Kill switch: {}\nActive server: {}\nBuilt-in voice servers: SMS, Minecraft Server, OmniCore Technologies.",
-        if ctx.data().voice.killed.load(Ordering::SeqCst) { "On" } else { "Off" }, active.as_deref().unwrap_or("None"))).await
+    private(
+        &ctx,
+        &format!(
+            "Kill switch: {}\nActive server: {}\nPreapproved voice servers: {}.",
+            if ctx.data().voice.killed.load(Ordering::SeqCst) {
+                "On"
+            } else {
+                "Off"
+            },
+            active.as_deref().unwrap_or("None"),
+            crate::config::VOICE_BUILTIN_GUILDS
+                .get()
+                .map_or(0, Vec::len)
+        ),
+    )
+    .await
 }
 
 #[poise::command(
@@ -910,8 +924,8 @@ mod tests {
         assert!(command.subcommands.iter().all(|item| item.dm_only));
         assert!(guild_id("not-an-id").is_err());
         assert_eq!(
-            guild_id("1554320480478167050").unwrap().get(),
-            1554320480478167050
+            guild_id("123456789012345678").unwrap().get(),
+            123456789012345678
         );
     }
 }

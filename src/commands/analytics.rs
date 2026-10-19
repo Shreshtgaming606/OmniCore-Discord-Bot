@@ -27,10 +27,10 @@ fn days(input: Option<&str>) -> Option<i64> {
 }
 
 fn is_developer(id: u64) -> bool {
-    developer_match(config::DEVELOPER_IDS.get(), id)
+    developer_match(config::DEVELOPER_IDS.get().map(Vec::as_slice), id)
 }
 
-fn developer_match(ids: Option<&[u64; 2]>, id: u64) -> bool {
+fn developer_match(ids: Option<&[u64]>, id: u64) -> bool {
     ids.is_some_and(|ids| ids.contains(&id))
 }
 
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn global_access_requires_exact_developer_id() {
-        let ids = [1109540816013234256, 1157083515486220429];
+        let ids = [101, 202];
         assert!(developer_match(Some(&ids), ids[0]));
         assert!(developer_match(Some(&ids), ids[1]));
         assert!(!developer_match(Some(&ids), 123));

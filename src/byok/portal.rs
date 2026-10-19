@@ -23,8 +23,6 @@ use std::{
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SITE: &str = "https://discordbot.omnicoretech.org";
-const CALLBACK: &str = "https://discordbot.omnicoretech.org/connect/callback";
 const COOKIE: &str = "omnicore_byok_session";
 const OAUTH_COOKIE: &str = "omnicore_byok_oauth";
 const LINK_LIFE: Duration = Duration::from_secs(600);
@@ -57,6 +55,8 @@ struct Session {
 }
 
 struct Portal {
+    site: String,
+    callback: String,
     client_id: String,
     client_secret: Zeroizing<String>,
     bot_token: Zeroizing<String>,
@@ -132,8 +132,20 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
-fn origin_ok(headers: &HeaderMap) -> bool {
-    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(SITE)
+fn origin_ok(headers: &HeaderMap, site: &str) -> bool {
+    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(site)
+}
+
+fn public_site(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.origin().ascii_serialization())
 }
 
 fn set_cookie(response: &mut Response, name: &str, value: &str, age: u32) {
@@ -167,7 +179,7 @@ pub async fn create_setup_link(guild: u64) -> Result<Option<String>, &'static st
             until: Instant::now() + LINK_LIFE,
         },
     );
-    Ok(Some(format!("{SITE}/connect/?token={token}")))
+    Ok(Some(format!("{}/connect/?token={token}", portal.site)))
 }
 
 pub fn maybe_start(service: Option<Arc<ByokService>>, bot_token: &str) {
@@ -186,7 +198,19 @@ pub fn maybe_start(service: Option<Arc<ByokService>>, bot_token: &str) {
         log::error!("Invalid Discord OAuth configuration; secure pairing portal is disabled");
         return;
     }
+    let Some(site) = std::env::var("OMNICORE_PUBLIC_BASE_URL")
+        .ok()
+        .as_deref()
+        .and_then(public_site)
+    else {
+        log::error!(
+            "Set OMNICORE_PUBLIC_BASE_URL to a public HTTPS origin to enable secure pairing"
+        );
+        return;
+    };
     let portal = Arc::new(Portal {
+        callback: format!("{site}/connect/callback"),
+        site,
         client_id,
         client_secret: Zeroizing::new(client_secret),
         bot_token: Zeroizing::new(bot_token.to_owned()),
@@ -288,7 +312,7 @@ async fn start(State(portal): State<Arc<Portal>>, Query(query): Query<StartQuery
     let url = format!(
         "https://discord.com/oauth2/authorize?response_type=code&client_id={}&scope=identify&redirect_uri={}&state={}&code_challenge={challenge}&code_challenge_method=S256",
         portal.client_id,
-        urlencoding::encode(CALLBACK),
+        urlencoding::encode(&portal.callback),
         state
     );
     let mut response = redirect(&url);
@@ -344,7 +368,7 @@ async fn callback(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", CALLBACK),
+            ("redirect_uri", portal.callback.as_str()),
             ("code_verifier", auth.verifier.as_str()),
         ])
         .send()
@@ -505,7 +529,7 @@ async fn validate(
     headers: HeaderMap,
     Form(form): Form<ValidateForm>,
 ) -> Response {
-    if !origin_ok(&headers) {
+    if !origin_ok(&headers, &portal.site) {
         return error_page(StatusCode::FORBIDDEN, "Invalid request origin.");
     }
     let Some((id, guild, user, csrf)) = portal.session(&headers).await else {
@@ -576,7 +600,7 @@ async fn pair(
     headers: HeaderMap,
     Form(form): Form<PairForm>,
 ) -> Response {
-    if !origin_ok(&headers) {
+    if !origin_ok(&headers, &portal.site) {
         return error_page(StatusCode::FORBIDDEN, "Invalid request origin.");
     }
     let Some((id, guild, user, csrf)) = portal.session(&headers).await else {
@@ -630,7 +654,7 @@ async fn disconnect(
     headers: HeaderMap,
     Form(form): Form<CsrfForm>,
 ) -> Response {
-    if !origin_ok(&headers) {
+    if !origin_ok(&headers, &portal.site) {
         return error_page(StatusCode::FORBIDDEN, "Invalid request origin.");
     }
     let Some((id, guild, user, csrf)) = portal.session(&headers).await else {
@@ -675,5 +699,29 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn custom_portal_origin_requires_clean_https_origin() {
+        assert_eq!(
+            public_site("https://example.org/"),
+            Some("https://example.org".into())
+        );
+        for bad in [
+            "http://example.org",
+            "https://example.org/connect",
+            "https://user@example.org",
+            "https://example.org/?token=abc",
+            "https://example.org/#fragment",
+        ] {
+            assert!(public_site(bad).is_none(), "accepted {bad}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://example.org"),
+        );
+        assert!(origin_ok(&headers, "https://example.org"));
+        assert!(!origin_ok(&headers, "https://different.example"));
     }
 }
