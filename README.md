@@ -48,7 +48,7 @@ Grant the bot View Channels, Send Messages, Read Message History, Embed Links, A
 
 ### MongoDB and retention
 
-`MONGO_URI` is required even if you use only cloud AI. The current code stores bot collections in the §omnicore_bot§ database. Keep MongoDB off the public internet, enable authentication and backups for production, and configure host log retention. AI turns have a 30-day TTL; usage and moderation metadata have their own expiry. See [retention and migration](docs/RETENTION.md). Do not run the legacy migration's apply mode without a reviewed backup and matching dry-run counts.
+`MONGO_URI` is required even if you use only cloud AI. The current code stores bot collections in the `omnicore_bot` database. Keep MongoDB off the public internet, enable authentication and backups for production, and configure host log retention. AI turns have a 30-day TTL; usage and moderation metadata have their own expiry. See [retention and migration](docs/RETENTION.md). Do not run the legacy migration's apply mode without a reviewed backup and matching dry-run counts.
 
 ### Local AI and AutoMod
 
