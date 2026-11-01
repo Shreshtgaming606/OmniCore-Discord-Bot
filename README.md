@@ -8,10 +8,15 @@ OmniCore is an open-source Discord bot written in Rust. It combines server tools
 
 - Slash and prefix commands for server information, roles, channel locks, moderation, and data deletion.
 - Automatic moderation with warnings, configurable temporary timeouts, owner notices, and metadata-only analytics. [Policy and permissions](docs/AUTOMOD.md).
+- Private text chat requires bot-owner approval. A first written DM creates a request; bot owners manage it in DMs with `/dmaccess`, and each approved user can set a personal AI preference. DM text is handled by local Ollama without persistent conversation history.
+
+In a private DM with OmniCore, bot owners can use `/dmaccess pending`, `/dmaccess approve user_id:<ID>`, `/dmaccess deny user_id:<ID>`, and `/dmaccess owner_prompt user_id:<ID> prompt:<TEXT>`. Approved users can use `/dmaccess my_prompt prompt:<TEXT>`, `/dmaccess clear_my_prompt`, and `/dmaccess status`. Bot-owner preferences take priority; neither prompt grants tools or moderation permissions. A server owner's separate DM image access still requires a connected provider key and explicit `/ai vision` opt-in.
 - Local Ollama chat and vision in bot-operator-approved guilds; server-owned OpenAI, Anthropic, or Gemini connections through a secure HTTPS `/ai setup` portal. Guild owners control models, limits, channels, roles, vision, and thinking. [Provider setup](docs/byok-operations.md).
 - Image questions can use attachments on the invoking message or its exact direct reply target. The bot does not search prior channel history for images. [Vision rules](docs/VISION.md).
 - Local `/imagegen` and `/imagine` generation with a compatible FLUX.2 Klein Ollama service. [Image generation requirements](docs/IMAGEGEN.md).
 - Opt-in voice sessions with local Whisper recognition and Piper speech, text transcripts and replies in the command channel, a two-minute idle disconnect, and a private bot-operator kill switch. Voice is limited to explicitly preapproved or operator-approved guilds.
+
+In a private DM with OmniCore, bot owners can use `/dmaccess pending`, `/dmaccess approve user_id:<ID>`, `/dmaccess deny user_id:<ID>`, and `/dmaccess owner_prompt user_id:<ID> prompt:<TEXT>`. Approved users can use `/dmaccess my_prompt prompt:<TEXT>`, `/dmaccess clear_my_prompt`, and `/dmaccess status`. Bot-owner preferences take priority; neither prompt grants tools or moderation permissions. A server owner's separate DM image access still requires a connected provider key and explicit `/ai vision` opt-in.
 
 ## Technology
 

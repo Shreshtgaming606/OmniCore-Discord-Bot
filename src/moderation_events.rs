@@ -1,5 +1,5 @@
-//! Metadata-only AutoMod events and durable, bounded Discord notification delivery.
-//! No Message or raw incident text crosses this boundary.
+//! AutoMod events and durable, bounded Discord notification delivery.
+//! A short incident excerpt is held in pending deliveries and removed after delivery.
 use crate::{automod::config::AutoModConfig, config, database};
 use futures::TryStreamExt;
 use mongodb::{
@@ -43,12 +43,45 @@ pub struct ModerationEvent {
     pub guild_owner: UserId,
     pub member_id: UserId,
     pub member_name: String,
+    pub message_text: String,
     pub channel_id: ChannelId,
     pub action: Action,
     pub category: &'static str,
     pub severity: &'static str,
     pub duration: Option<Duration>,
     pub occurred_at: DateTime,
+}
+
+const MAX_EXCERPT_CHARS: usize = 800;
+
+fn safe_excerpt(input: &str) -> String {
+    let text = input
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(MAX_EXCERPT_CHARS + 1)
+        .collect::<String>()
+        .replace('@', "@\u{200b}")
+        .replace('`', "' ");
+    if text.chars().count() > MAX_EXCERPT_CHARS {
+        format!(
+            "{}… [truncated]",
+            text.chars().take(MAX_EXCERPT_CHARS).collect::<String>()
+        )
+    } else if text.trim().is_empty() {
+        "[no text]".to_string()
+    } else {
+        text
+    }
+}
+
+fn excerpt_line(delivery: &Document) -> String {
+    delivery
+        .get_str("message_excerpt")
+        .unwrap_or("[unavailable]")
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn safe_label(input: &str) -> String {
@@ -210,6 +243,7 @@ impl NotificationService {
                 "recipient_id": recipient.to_string(),
                 "is_owner": is_owner,
                 "is_developer": is_developer,
+                "message_excerpt": safe_excerpt(&event.message_text),
                 "fallback_channel_id": if is_owner { settings.log_channel_id.map(|id| id.to_string()) } else { None },
                 "status": "pending",
                 "attempts": 0,
@@ -228,14 +262,24 @@ impl NotificationService {
     }
 }
 
-fn owner_message(event: &Document) -> String {
-    let duration = event
+fn duration_line(event: &Document) -> String {
+    event
         .get_i64("duration_seconds")
         .ok()
-        .map(|s| format!("\nDuration: {} minutes", s / 60))
-        .unwrap_or_default();
+        .map(|s| {
+            if s >= 60 && s % 60 == 0 {
+                format!("\nDuration: {} minutes", s / 60)
+            } else {
+                format!("\nDuration: {s} seconds")
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn owner_message(event: &Document, delivery: &Document) -> String {
+    let duration = duration_line(event);
     format!(
-        "OMNICORE MODERATION ALERT\nServer: {} ({})\nMember: {} (ID: {})\nAction: {}{}\nReason: {}\nSeverity: {}\nChannel: <#{}>\nTime: <t:{}:F>\nStatus: {}\n\nThe server owner can configure AutoMod with /automod settings.",
+        "OMNICORE MODERATION ALERT\nServer: {} ({})\nUser: {} (ID: {})\nAction: {}{}\nReason: {}\nSeverity: {}\nChannel: <#{}>\nTime: <t:{}:F>\nStatus: {}\nMessage:\n{}\n\nThe server owner can configure AutoMod with /automod settings.",
         event.get_str("guild_name").unwrap_or("Unknown"),
         event.get_str("guild_id").unwrap_or("?"),
         event.get_str("member_name").unwrap_or("Unknown"),
@@ -248,29 +292,30 @@ fn owner_message(event: &Document) -> String {
         event
             .get_datetime("occurredAt")
             .map_or(0, |t| t.timestamp_millis() / 1_000),
-        event.get_str("status").unwrap_or("unknown")
+        event.get_str("status").unwrap_or("unknown"),
+        excerpt_line(delivery)
     )
 }
 
-fn developer_message(event: &Document) -> String {
-    let duration = event
-        .get_i64("duration_seconds")
-        .ok()
-        .map(|s| format!("\nDuration: {s} seconds"))
-        .unwrap_or_default();
+fn developer_message(event: &Document, delivery: &Document) -> String {
+    let duration = duration_line(event);
     format!(
-        "OMNICORE OPERATOR MODERATION ALERT\nGuild: {} ({})\nAction: {}{}\nCategory: {}\nSeverity: {}\nTime: <t:{}:F>\nStatus: {}\nIncident: {}\nNo message content is included.",
+        "OMNICORE OPERATOR MODERATION ALERT\nServer: {} ({})\nUser: {} (ID: {})\nAction: {}{}\nReason: {}\nSeverity: {}\nChannel: <#{}>\nTime: <t:{}:F>\nStatus: {}\nIncident: {}\nMessage:\n{}",
         event.get_str("guild_name").unwrap_or("Unknown"),
         event.get_str("guild_id").unwrap_or("?"),
+        event.get_str("member_name").unwrap_or("Unknown"),
+        event.get_str("member_id").unwrap_or("?"),
         event.get_str("action").unwrap_or("unknown"),
         duration,
         event.get_str("category").unwrap_or("Unknown"),
         event.get_str("severity").unwrap_or("unknown"),
+        event.get_str("channel_id").unwrap_or("?"),
         event
             .get_datetime("occurredAt")
             .map_or(0, |t| t.timestamp_millis() / 1_000),
         event.get_str("status").unwrap_or("unknown"),
-        event.get_str("_id").unwrap_or("?")
+        event.get_str("_id").unwrap_or("?"),
+        excerpt_line(delivery)
     )
 }
 
@@ -322,9 +367,9 @@ async fn deliver_due(http: &serenity::Http) -> mongodb::error::Result<()> {
         };
         let is_owner = delivery.get_bool("is_owner").unwrap_or(false);
         let content = if is_owner {
-            owner_message(&event)
+            owner_message(&event, &delivery)
         } else {
-            developer_message(&event)
+            developer_message(&event, &delivery)
         };
         let message = CreateMessage::new()
             .content(content.clone())
@@ -349,17 +394,21 @@ async fn deliver_due(http: &serenity::Http) -> mongodb::error::Result<()> {
             deliveries
                 .update_one(
                     doc! {"_id": id},
-                    doc! {"$set": {"status": "sent", "sentAt": DateTime::now()}},
+                    doc! {"$set": {"status": "sent", "sentAt": DateTime::now()}, "$unset": {"message_excerpt": ""}},
                 )
                 .await?;
         } else {
             let attempts = delivery.get_i32("attempts").unwrap_or(0) + 1;
             let final_failure = attempts >= MAX_ATTEMPTS;
             let wait_ms = (1_i64 << attempts.min(5)) * 5_000;
-            deliveries.update_one(doc! {"_id": id}, doc! {"$set": {
+            let mut update = doc! {"$set": {
                 "status": if final_failure { "failed" } else { "pending" },
                 "nextAttempt": DateTime::from_millis(DateTime::now().timestamp_millis()+wait_ms),
-            }}).await?;
+            }};
+            if final_failure {
+                update.insert("$unset", doc! {"message_excerpt": ""});
+            }
+            deliveries.update_one(doc! {"_id": id}, update).await?;
             log::warn!(
                 "AutoMod notification delivery failed incident={} recipient={} final={final_failure}",
                 incident,
@@ -422,7 +471,7 @@ async fn owner_fallback(http: &serenity::Http, delivery: &Document, content: &st
 mod tests {
     use super::*;
     #[test]
-    fn event_carries_no_message_contents_and_caps_duration() {
+    fn event_keeps_text_out_of_metadata_and_caps_duration() {
         let event = ModerationEvent {
             incident_id: 1,
             guild_id: GuildId::new(2),
@@ -430,6 +479,7 @@ mod tests {
             guild_owner: UserId::new(3),
             member_id: UserId::new(4),
             member_name: "Member".into(),
+            message_text: "Bad @everyone message".into(),
             channel_id: ChannelId::new(5),
             action: Action::Timeout,
             category: "Harassment",
@@ -440,7 +490,12 @@ mod tests {
         let document = event_document(&event);
         assert_eq!(document.get_i64("duration_seconds").unwrap(), 172_800);
         assert!(!document.contains_key("content"));
-        assert!(!developer_message(&document).contains("Member"));
+        assert!(!document.contains_key("message_text"));
+        let delivery = doc! {"message_excerpt": safe_excerpt(&event.message_text)};
+        let alert = developer_message(&document, &delivery);
+        assert!(alert.contains("User: Member (ID: 4)"));
+        assert!(alert.contains("Server: Test (2)"));
+        assert!(alert.contains("Bad @\u{200b}everyone message"));
     }
 
     #[test]
@@ -452,6 +507,7 @@ mod tests {
             guild_owner: UserId::new(30),
             member_id: UserId::new(40),
             member_name: "Member".into(),
+            message_text: "Example".into(),
             channel_id: ChannelId::new(50),
             action: Action::Warning,
             category: "Harassment",

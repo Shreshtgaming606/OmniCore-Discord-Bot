@@ -3,6 +3,7 @@ mod byok;
 mod commands;
 mod config;
 mod database;
+mod dm_access;
 mod logging;
 mod moderation_events;
 mod retention;
@@ -115,6 +116,12 @@ async fn event_handler(
                 return Ok(());
             }
 
+            if new_message.guild_id.is_none()
+                && dm_access::handle_message(ctx, new_message, data).await?
+            {
+                return Ok(());
+            }
+
             let bot_id = ctx
                 .cache()
                 .expect("Failed to access cache")
@@ -198,6 +205,9 @@ async fn main() {
     voice::ensure_indexes()
         .await
         .expect("Failed to ensure voice usage indexes");
+    dm_access::ensure_indexes()
+        .await
+        .expect("Failed to ensure DM access indexes");
 
     let mut owners: HashSet<serenity::UserId> = HashSet::from([]);
 
@@ -225,6 +235,7 @@ async fn main() {
         commands::analytics::analytics(),
         commands::ai::byok_commands::ai(),
         commands::ai::byok_commands::ask(),
+        dm_access::dmaccess(),
         commands::ai::imagegen::imagegen(),
         commands::ai::imagegen::imagine(),
         commands::ai::imagegen::imagegenstop(),

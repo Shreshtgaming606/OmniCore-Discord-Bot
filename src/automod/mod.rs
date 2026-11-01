@@ -652,6 +652,7 @@ impl AutoModService {
                     guild_owner: guild.owner_id,
                     member_id: message.author.id,
                     member_name: message.author.name.clone(),
+                    message_text: message.content.clone(),
                     channel_id: message.channel_id,
                     action,
                     category: assessment.reason(),

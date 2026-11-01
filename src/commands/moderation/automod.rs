@@ -206,7 +206,7 @@ pub async fn notifications(
 #[poise::command(slash_command, guild_only, category = "Moderation")]
 pub async fn diagnostics(
     ctx: CustomContext<'_>,
-    #[description = "Send metadata-only AutoMod alerts to the two OmniCore operators"]
+    #[description = "Send AutoMod alerts with user and message excerpt to OmniCore operators"]
     enabled: bool,
 ) -> Result<(), Error> {
     if !owner_check(&ctx).await? {
@@ -218,7 +218,7 @@ pub async fn diagnostics(
     respond(
         &ctx,
         if enabled {
-            "Operator diagnostic alerts enabled. They exclude message text and member identity."
+            "Operator alerts enabled. They include the username, user ID, server, and a short excerpt of the flagged message."
         } else {
             "Operator diagnostic alerts disabled for this server."
         },
