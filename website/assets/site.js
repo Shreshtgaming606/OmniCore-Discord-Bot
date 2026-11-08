@@ -46,6 +46,27 @@ if (search && commandItems.length && count && empty) {
   update();
 }
 
+const guideSearch = document.querySelector('#guide-search');
+const guideTopics = [...document.querySelectorAll('.guide-topic')];
+const guideTopicCount = document.querySelector('#guide-topic-count');
+const guideSearchEmpty = document.querySelector('#guide-search-empty');
+if (guideSearch && guideTopics.length && guideTopicCount && guideSearchEmpty) {
+  const updateGuideTopics = () => {
+    const words = guideSearch.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    let visible = 0;
+    for (const topic of guideTopics) {
+      const haystack = `${topic.dataset.search} ${topic.textContent}`.toLowerCase();
+      const matches = words.every(word => haystack.includes(word));
+      topic.hidden = !matches;
+      if (matches) visible++;
+    }
+    guideTopicCount.textContent = `${visible} topic${visible === 1 ? '' : 's'}`;
+    guideSearchEmpty.hidden = visible !== 0;
+  };
+  guideSearch.addEventListener('input', updateGuideTopics);
+  updateGuideTopics();
+}
+
 if ('IntersectionObserver' in window && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
   const reveal = [...document.querySelectorAll('.overview-title, .overview-list, .spotlight-layout > div, .ai-copy, .transparency-layout > *, .feature-grid > *, .tool-columns > *, .support-grid > *')];
   const observer = new IntersectionObserver(entries => {

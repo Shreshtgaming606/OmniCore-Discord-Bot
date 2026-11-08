@@ -5,15 +5,15 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0b1224">
   <title>Guidebook | OmniCore Discord Bot</title>
-  <meta name="description" content="Learn how to set up and use OmniCore. Step-by-step guides for Discord server owners, moderators, and members, with command examples and troubleshooting.">
+  <meta name="description" content="Find the right OmniCore guide for members, server owners, and moderators. Search common tasks and follow clear Discord command examples.">
   <link rel="canonical" href="https://discordbot.omnicoretech.org/guide/">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="apple-touch-icon" href="/brand/omnicore-bot-256.png">
   <link rel="preload" href="/assets/manrope-latin.woff2" as="font" type="font/woff2" crossorigin>
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="OmniCore Discord Bot">
-  <meta property="og:title" content="OmniCore Guidebook">
-  <meta property="og:description" content="A practical guide to OmniCore for server owners, moderators, and members.">
+  <meta property="og:title" content="Guidebook | OmniCore Guidebook">
+  <meta property="og:description" content="Find the right OmniCore guide for members, server owners, and moderators. Search common tasks and follow clear Discord command examples.">
   <meta property="og:url" content="https://discordbot.omnicoretech.org/guide/">
   <meta property="og:image" content="https://discordbot.omnicoretech.org/brand/omnicore-bot-1024.png">
   <meta property="og:image:alt" content="OmniCore geometric core logo">
@@ -25,138 +25,37 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header"><div class="shell header-inner"><a class="brand" href="/" aria-label="OmniCore home"><img src="/brand/omnicore-bot-mark.svg" width="38" height="38" alt=""><span>OmniCore</span></a><button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav"><span></span><span></span></button><nav id="site-nav" class="site-nav" aria-label="Primary navigation"><a href="/">Home</a><a href="/features/">Features</a><a href="/commands/">Commands</a><a href="/guide/" aria-current="page">Guidebook</a><a href="/about/">About</a><a href="/support/">Support</a><a class="nav-install" href="https://discord.com/oauth2/authorize?client_id=1521673931134603304&amp;scope=bot%20applications.commands&amp;permissions=1374661209111&amp;integration_type=0">Add OmniCore to Discord <span aria-hidden="true">↗</span></a></nav></div></header>
 <main id="main">
-  <section class="guide-intro shell" aria-labelledby="guide-title">
-    <p class="eyebrow">OmniCore guidebook</p>
-    <h1 id="guide-title">Make the most of your bot.</h1>
-    <p class="guide-intro-copy">Start with your role, then follow the examples. This guide covers setup, everyday commands, AI, image tools, moderation, and what to try when something does not work.</p>
-    <div class="guide-role-links" aria-label="Choose your path">
-      <a class="guide-role-link" href="#owners"><span class="guide-role-number">01 / SERVER OWNER</span><strong>Set up your server</strong><span>Choose moderation, AI access, limits, and server settings.</span><span class="guide-role-arrow" aria-hidden="true">↗</span></a>
-      <a class="guide-role-link" href="#members"><span class="guide-role-number">02 / MEMBER</span><strong>Start using OmniCore</strong><span>Ask questions, work with images, and find commands.</span><span class="guide-role-arrow" aria-hidden="true">↗</span></a>
-    </div>
-  </section>
-  <div class="guide-layout shell">
-    <aside class="guide-toc" aria-label="Guidebook contents">
-      <p>On this page</p>
-      <a href="#start">Start here</a>
-      <a href="#owners">Server owners</a>
-      <a href="#members">Members</a>
-      <a href="#moderators">Moderators</a>
-      <a href="#bot-owners">Bot owners</a>
-      <a href="#troubleshooting">Troubleshooting</a>
-      <a href="#privacy">Privacy and data</a>
-    </aside>
-    <article class="guide-content">
-      <section id="start" class="guide-section" aria-labelledby="start-title">
-        <p class="guide-section-label">Start here</p>
-        <h2 id="start-title">Get started in three steps</h2>
-        <p>OmniCore has tools anyone can use, moderation commands that require Discord permissions, and settings reserved for the actual server owner. OmniCore bot owners are a separate group: they approve local AI and private DM requests.</p>
-        <ol class="guide-steps">
-          <li><strong>Add OmniCore</strong><span>Use the <a href="/install/">installation page</a> if the bot is not in your server. Give it only the permissions needed for the features you plan to use.</span></li>
-          <li><strong>Find a command</strong><span>Type <code>/</code> in a Discord text channel and choose OmniCore, or run <code>/help</code>. Discord shows the command options before you send it.</span></li>
-          <li><strong>Check AI access</strong><span>Local chat and image generation require approval from an OmniCore bot owner. A server owner can instead connect their own OpenAI, Anthropic, or Gemini account with <code>/ai setup</code>. AutoMod works independently of chat approval.</span></li>
-        </ol>
-        <div class="guide-callout"><strong>How to read examples</strong><p>In <code>/time member:@Alex duration:10m</code>, the text before each colon is an option name. Discord supplies the option fields; select the real member, channel, or role in its picker. Examples here use placeholder names.</p></div>
-      </section>
 
-      <section id="owners" class="guide-section" aria-labelledby="owners-title">
-        <p class="guide-section-label">Path 01 / Server owner</p>
-        <h2 id="owners-title">Configure your server</h2>
-        <p>The server owner is the Discord account that owns the server. Administrator permission alone does not grant access to OmniCore's owner-only <code>/ai</code> or <code>/automod</code> controls.</p>
-        <h3 id="owner-moderation">1. Review AutoMod</h3>
-        <p>AutoMod is enabled by default. Run <code>/automod status</code> to see the current policy. A first confirmed violation produces a warning; another confirmed violation by the same member within 24 hours can produce a timeout when timeouts are enabled and Discord permits it. Server owners and protected staff can be warned but are not automatically timed out.</p>
-        <div class="guide-example"><span>Example setup</span><code>/automod sensitivity level:normal</code><code>/automod warnings enabled:true</code><code>/automod timeouts enabled:true</code><code>/automod timeout level:moderate duration:10m</code></div>
-        <p>Use <code>/automod notifications enabled:true</code> for owner alerts. <code>/automod diagnostics enabled:true</code> sends bot operators an alert containing the server, user, and a short excerpt of the flagged message. <code>/automod log-channel</code> sets a private fallback channel for owner notices when DMs fail. It must deny View Channel to <code>@everyone</code>. Run <code>/analytics moderation period:30d</code> to review trends.</p>
-        <h3 id="owner-ai">2. Choose the AI route</h3>
-        <p>Run <code>/ai status</code> first. If OmniCore's bot owners approved local AI for your server, mentions use local Ollama and do not need your API key. Otherwise, run <code>/ai setup</code> to open a private, one-use HTTPS setup link. Connect your own provider key there; never paste a key into Discord. Provider requests can incur charges to your account.</p>
-        <p>After connecting, <code>/ai model</code> selects an available model. <code>/ai vision</code> shows image settings, lets you choose a vision-capable model, and limits images to one through three. <code>/ai limits</code> controls daily use and concurrency; <code>/ai channel</code> and <code>/ai role</code> restrict who can use provider AI. <code>/ai usage</code> shows recent request and token counts. <code>/ai thinking</code> controls local Ollama thinking for server text; it does not change a cloud provider's reasoning settings.</p>
-        <div class="guide-callout"><strong>AI is optional</strong><p>Moderation and server utilities still work without a connected provider. If the bot says no provider is connected, the server owner can use <code>/ai setup</code>; if the server is approved for local AI, use <code>/ai status</code> to confirm that route.</p></div>
-        <h3 id="owner-controls">Owner command map</h3>
-        <div class="guide-table-wrap" tabindex="0" aria-label="Scrollable server owner command table"><table class="guide-table"><caption>Commands reserved for the server owner</caption><thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead><tbody>
-          <tr><td><code>/automod status</code> · <code>/automod settings</code></td><td>Show the current AutoMod policy.</td></tr>
-          <tr><td><code>/automod enable</code> · <code>/automod disable</code></td><td>Turn automatic moderation on or off.</td></tr>
-          <tr><td><code>/automod sensitivity</code> · <code>/automod timeout</code></td><td>Choose review sensitivity and timeout durations.</td></tr>
-          <tr><td><code>/automod warnings</code> · <code>/automod timeouts</code></td><td>Control warnings and automatic timeouts separately.</td></tr>
-          <tr><td><code>/automod notifications</code> · <code>/automod diagnostics</code> · <code>/automod log-channel</code></td><td>Manage owner and operator alerts and the private fallback channel.</td></tr>
-          <tr><td><code>/ai setup</code> · <code>/ai status</code> · <code>/ai provider</code></td><td>Connect a provider securely or inspect the current AI route.</td></tr>
-          <tr><td><code>/ai model</code> · <code>/ai vision</code> · <code>/ai thinking</code></td><td>Choose AI models and local thinking behavior.</td></tr>
-          <tr><td><code>/ai settings</code> · <code>/ai limits</code> · <code>/ai channel</code> · <code>/ai role</code></td><td>Inspect usage rules and restrict provider AI access.</td></tr>
-          <tr><td><code>/ai usage</code> · <code>/ai disconnect</code></td><td>Review recent provider usage or remove the stored key.</td></tr>
-          <tr><td><code>/analytics moderation</code></td><td>See this server's moderation trends for 7, 30, or 90 days.</td></tr>
-        </tbody></table></div>
-        <p>A server administrator can use <code>/change_prompt</code> to change the server-wide local chat prompt and <code>/delete_memory</code> to remove saved server AI history. <code>/get_prompt</code> reads the current prompt, and <code>/remove_prompt</code> clears it. These are distinct from a member's private DM prompt.</p>
-      </section>
+<section class="guide-home-hero shell" aria-labelledby="guide-title">
+  <p class="eyebrow">OmniCore guidebook</p>
+  <h1 id="guide-title">What do you want to do?</h1>
+  <p>Choose your path or jump straight to a task. Each guide uses short steps and examples you can try in Discord.</p>
 
-      <section id="members" class="guide-section" aria-labelledby="members-title">
-        <p class="guide-section-label">Path 02 / Member</p>
-        <h2 id="members-title">Use OmniCore day to day</h2>
-        <h3 id="member-basics">Find information</h3>
-        <p>Run <code>/help</code> to browse commands, <code>/serverinfo</code> for server details, and <code>/ping</code> to check whether OmniCore is responding. <code>/all</code> and <code>/role all</code> list roles; <code>/highest_role_from_member</code> and <code>/compare_roles</code> help explain role order. Some commands are server-only; Discord may hide commands you cannot use.</p>
-        <h3 id="member-chat">Ask the AI</h3>
-        <p>In a server with AI access, mention <code>@OmniCore</code> in your message or reply to one of its messages. In a server using a connected provider, <code>/ask question:...</code> is another way to ask. AI may be limited by channel, role, daily quota, or model availability. If you are denied access, ask the server owner to review <code>/ai status</code>, <code>/ai channel</code>, and <code>/ai role</code>.</p>
-        <div class="guide-example"><span>Example</span><code>@OmniCore Can you explain this server's event schedule?</code></div>
-        <h3 id="member-images">Understand or generate images</h3>
-        <p>For image recognition, attach a PNG, JPEG, WebP, or GIF to the same message as your <code>@OmniCore</code> question, or reply directly to the exact message containing the image and mention OmniCore. It does not search earlier unrelated messages or other channels. The limit is at most three images per request, and an owner can set a lower limit. A text-only selected model cannot analyze images.</p>
-        <div class="guide-example"><span>Two valid image questions</span><code>@OmniCore What is in this screenshot? [attach image]</code><code>[Reply directly to the image] @OmniCore What does this error mean?</code></div>
-        <p>Where local image generation is available, <code>/imagegen prompt:...</code> and <code>/imagine prompt:...</code> do the same thing: generate a public image from your description. Only bot-owner-approved local AI servers can use them. Use <code>/imagegenstop</code> to cancel your own active request; server and bot owners can stop requests they manage. Generation may queue and can fail when the local model or disk space is unavailable.</p>
-        <h3 id="member-dms">Private DMs</h3>
-        <p>Your first written DM to OmniCore becomes a request to the bot owners. They see your username, ID, and a short excerpt, then approve or deny it. The first message is not sent to AI. Once approved, you can chat privately using local Ollama, run <code>/dmaccess status</code>, set a personal response preference with <code>/dmaccess my_prompt</code>, or clear it with <code>/dmaccess clear_my_prompt</code>. Bot-owner preferences for your account take priority. Private text chat does not keep a persistent bot conversation history.</p>
-        <p>DM image analysis has a separate restriction: only a current server owner who enabled <code>/ai vision dm_enabled:true</code> for their own connected provider key can use that key in DMs. Provider usage may cost money. An approved text DM alone does not enable DM images.</p>
-        <div class="guide-table-wrap" tabindex="0" aria-label="Scrollable member command table"><table class="guide-table"><caption>Everyday commands for members</caption><thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead><tbody>
-          <tr><td><code>/help</code> · <code>/info</code> · <code>/ping</code></td><td>Find commands, read bot details, or check responsiveness.</td></tr>
-          <tr><td><code>/serverinfo</code> · <code>/all</code> · <code>/role all</code></td><td>Inspect server information and roles.</td></tr>
-          <tr><td><code>/highest_role_from_member</code> · <code>/compare_roles</code></td><td>Compare member and role positions.</td></tr>
-          <tr><td><code>/ask</code> · mention <code>@OmniCore</code></td><td>Ask the connected provider or talk to the assistant where AI is allowed.</td></tr>
-          <tr><td><code>/imagegen</code> · <code>/imagine</code> · <code>/imagegenstop</code></td><td>Generate an image in an approved local AI server, or stop your request.</td></tr>
-          <tr><td><code>/dmaccess status</code> · <code>/dmaccess my_prompt</code></td><td>Check private-chat approval and set a personal prompt after approval.</td></tr>
-          <tr><td><code>/delete_my_data</code></td><td>Delete AI turns linked to your account and your DM access and prompt record.</td></tr>
-        </tbody></table></div>
-      </section>
-
-      <section id="moderators" class="guide-section" aria-labelledby="moderators-title">
-        <p class="guide-section-label">For moderators</p>
-        <h2 id="moderators-title">Use Discord permissions deliberately</h2>
-        <p>Moderation commands check the caller's Discord permissions. OmniCore also needs the matching bot permission and a role above the target for actions such as timeouts, kicks, and bans. The server owner can configure AutoMod separately; moderators do not need to run AutoMod manually for every message.</p>
-        <div class="guide-table-wrap" tabindex="0" aria-label="Scrollable moderation command table"><table class="guide-table"><caption>Moderator command reference</caption><thead><tr><th scope="col">Command</th><th scope="col">Required permission</th><th scope="col">Result</th></tr></thead><tbody>
-          <tr><td><code>/time</code> · <code>/untime</code></td><td>Moderate Members</td><td>Apply or remove a temporary timeout.</td></tr>
-          <tr><td><code>/kick</code></td><td>Kick Members</td><td>Remove a member without banning them.</td></tr>
-          <tr><td><code>/ban</code> · <code>/unban</code></td><td>Ban Members</td><td>Ban a member or lift a ban.</td></tr>
-          <tr><td><code>/purge</code></td><td>Manage Messages</td><td>Remove a chosen number of recent messages.</td></tr>
-          <tr><td><code>/lock</code> · <code>/unlock</code></td><td>Manage Channels; bot also needs Manage Roles</td><td>Restrict or restore access to a channel.</td></tr>
-          <tr><td><code>/set_prefix</code></td><td>Manage Server</td><td>Change the server's optional text-command prefix.</td></tr>
-        </tbody></table></div>
-        <p>A server owner can also ask OmniCore to time out one clearly mentioned member for up to two days by mentioning the bot and specifying a duration. The bot checks the target and Discord permissions outside the AI model.</p>
-      </section>
-
-      <section id="bot-owners" class="guide-section" aria-labelledby="bot-owners-title">
-        <p class="guide-section-label">Different from a server owner</p>
-        <h2 id="bot-owners-title">What OmniCore bot owners control</h2>
-        <p>Bot owners operate OmniCore across servers. They can approve or disapprove local AI for a guild and manage private DM requests. A server owner cannot run these operator commands just because they own a Discord server.</p>
-        <p>In a private DM with OmniCore, bot owners can run <code>/dmaccess pending</code>, <code>/dmaccess approve user_id:...</code>, <code>/dmaccess deny user_id:...</code>, and <code>/dmaccess owner_prompt user_id:... prompt:...</code>. Other operator controls include <code>/restart</code> in a server. If you need operator approval, contact the bot team through the <a href="/support/">support page</a>; do not post API keys or private message content in a public channel.</p>
-      </section>
-
-      <section id="troubleshooting" class="guide-section" aria-labelledby="troubleshooting-title">
-        <p class="guide-section-label">When something does not work</p>
-        <h2 id="troubleshooting-title">Quick fixes</h2>
-        <div class="guide-faq">
-          <details><summary>I cannot see a command.</summary><p>Type <code>/</code> and select OmniCore, then check your Discord permissions and whether the command is server-only or DM-only. A newly registered global command can take time to appear; try closing and reopening the command picker. <a href="/commands/">Browse the command reference</a>.</p></details>
-          <details><summary>OmniCore says AI is unavailable.</summary><p>Ask the server owner to run <code>/ai status</code>. The guild needs bot-owner approval for local AI or a connected provider from <code>/ai setup</code>. Channel or role restrictions, daily limits, an unavailable model, or a provider error can also block a request.</p></details>
-          <details><summary>It did not analyze the picture above.</summary><p>Attach the image to your own question or reply directly to the exact image message. OmniCore never searches earlier unrelated messages. Check the format and image count, and ask the owner whether the selected model supports vision.</p></details>
-          <details><summary>AutoMod warned someone but did not time them out.</summary><p>The first confirmed violation is a warning. A later confirmed violation within 24 hours can time out an eligible member only when timeouts are enabled and the bot has Moderate Members permission with a higher role. Server owners and protected staff are not automatically timed out. Ask the owner to check <code>/automod status</code>.</p></details>
-
-          <details><summary>Image generation failed or stopped.</summary><p>The local image model, queue, memory, or host disk guard may be unavailable. Image generation requires bot-owner-approved local AI and at least 10 GiB of free internal disk space on this installation. Try again later or ask an operator to check the service; do not repeatedly submit the same job.</p></details>
-        </div>
-        <p class="guide-help-link">Still stuck? Visit <a href="/support/">Support</a> and include the command name, server, and approximate time. Never share a bot token or API key.</p>
-      </section>
-
-      <section id="privacy" class="guide-section" aria-labelledby="privacy-title">
-        <p class="guide-section-label">Your data</p>
-        <h2 id="privacy-title">Know what OmniCore sees</h2>
-        <p>Server AI chats are retained for a limited period so OmniCore can answer with recent context. Explicit image questions send only the attached or directly replied-to images for that request; image bytes are not stored in the bot's long-term memory. AutoMod alerts may include a short excerpt of a flagged message. A first private DM sends its excerpt to bot owners for approval; approved private text chat is stateless in the bot.</p>
-        <p>Use <code>/delete_my_data</code> for your linked AI turns and DM access record. Server administrators can use <code>/delete_memory</code> for server AI history. Read the <a href="/privacy/">Privacy Policy</a> for exact retention, provider sharing, and deletion limits.</p>
-      </section>
-    </article>
+</section>
+<section class="guide-home-choices shell" aria-labelledby="guide-choose-title">
+  <h2 id="guide-choose-title">Start with your role</h2>
+  <div class="guide-paths">
+    <a class="guide-path" href="/guide/members/"><span class="guide-path-overline">For members</span><strong>Use OmniCore</strong><span>Ask questions, analyze images, generate pictures, and request DM access.</span><b aria-hidden="true">↗</b></a>
+    <a class="guide-path" href="/guide/owners/"><span class="guide-path-overline">For server owners</span><strong>Set up your server</strong><span>Choose AI access, configure AutoMod, and manage permissions and limits.</span><b aria-hidden="true">↗</b></a>
   </div>
-  <section class="guide-end"><div class="shell guide-end-inner"><div><p class="eyebrow">Keep exploring</p><h2>Ready for the next command?</h2><p>Use the searchable command list when you need exact options and permissions.</p></div><a class="button button-primary" href="/commands/">Browse commands <span aria-hidden="true">↗</span></a></div></section>
+</section>
+<section class="guide-home-tasks shell" aria-labelledby="guide-tasks-title">
+  <div class="guide-section-heading"><div><p class="eyebrow">Go straight to an answer</p><h2 id="guide-tasks-title">Common tasks</h2></div><p id="guide-topic-count" role="status" aria-live="polite">8 topics</p></div>
+  <div class="guide-search"><label for="guide-search">Find a topic</label><input id="guide-search" type="search" placeholder="Try images, AI setup, AutoMod, or DMs" autocomplete="off" aria-describedby="guide-search-help"><span id="guide-search-help">This filters the tasks below. For every slash command, use the <a href="/commands/">command reference</a>.</span></div>
+  <div class="guide-task-list" id="guide-task-list">
+    <a class="guide-topic" href="/guide/members/#chat" data-search="ask ai question chat mention omnicore assistant"><span>Member</span><strong>Ask OmniCore a question</strong><small>Mention the bot or use /ask</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/members/#images" data-search="image photo screenshot describe vision picture reply attachment"><span>Member</span><strong>Ask about an image</strong><small>Attach it or reply directly to it</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/members/#generation" data-search="generate image imagine imagegen stop cancel picture"><span>Member</span><strong>Generate a picture</strong><small>Use /imagine or /imagegen</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/members/#dm" data-search="direct message dm private approval prompt"><span>Member</span><strong>Request private DM access</strong><small>How approval and personal prompts work</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/owners/#ai" data-search="ai provider setup ollama key model local approve"><span>Server owner</span><strong>Set up AI</strong><small>Local approval or your provider key</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/owners/#automod" data-search="automod warning timeout moderation alerts sensitivity"><span>Server owner</span><strong>Configure AutoMod</strong><small>Warnings, timeouts, and alerts</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/owners/#moderators" data-search="moderator time kick ban purge lock permissions"><span>Moderator</span><strong>Moderate a member</strong><small>Commands and required permissions</small><b aria-hidden="true">↗</b></a>
+    <a class="guide-topic" href="/guide/help/" data-search="help troubleshooting error missing command image ai offline failed"><span>Anyone</span><strong>Fix a problem</strong><small>Common errors and what to check</small><b aria-hidden="true">↗</b></a>
+  </div>
+  <p class="guide-search-empty" id="guide-search-empty" hidden>No matching topic. Try another word or browse the <a href="/commands/">command reference</a>.</p>
+</section>
+<section class="guide-home-more"><div class="shell guide-home-more-inner"><div><p class="eyebrow">Need the exact command?</p><h2>Browse the full command list.</h2></div><a class="button button-primary" href="/commands/">Open command reference <span aria-hidden="true">↗</span></a></div></section>
+
 </main>
 <footer class="site-footer"><div class="shell footer-grid"><div class="footer-brand"><a class="brand" href="/"><img src="/brand/omnicore-bot-mark.svg" width="42" height="42" alt=""><span>OmniCore</span></a><p>Practical tools for Discord communities.</p></div><div><h2>Explore</h2><a href="/">Home</a><a href="/features/">Features</a><a href="/commands/">Commands</a><a href="/guide/">Guidebook</a><a href="/about/">About</a><a href="/support/">Support</a></div><div><h2>Legal</h2><a href="/privacy/">Privacy Policy</a><a href="/terms/">Terms of Service</a></div><div><h2>Discord</h2><a href="https://discord.com/oauth2/authorize?client_id=1521673931134603304&amp;scope=bot%20applications.commands&amp;permissions=1374661209111&amp;integration_type=0">Add OmniCore to Discord</a></div></div><div class="shell footer-bottom"><span>© 2026 OmniCore contributors. Source: GPL-3.0.</span><span>Discord is a trademark of Discord Inc. OmniCore is not affiliated with or endorsed by Discord Inc.</span></div></footer>
 </body>
