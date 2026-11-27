@@ -1,6 +1,7 @@
 pub(crate) mod ai;
 pub(crate) mod analytics;
 pub(crate) mod basic_utils;
+pub(crate) mod management;
 pub(crate) mod moderation;
 pub(crate) mod owner_commands;
 pub(crate) mod voice;

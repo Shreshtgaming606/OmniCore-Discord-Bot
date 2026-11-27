@@ -232,6 +232,7 @@ async fn main() {
         commands::moderation::purge::purge(),
         commands::moderation::time::time(),
         commands::moderation::automod::automod(),
+        commands::management::management(),
         commands::analytics::analytics(),
         commands::ai::byok_commands::ai(),
         commands::ai::byok_commands::ask(),
@@ -281,7 +282,7 @@ async fn main() {
         token,
         voice_killed,
     );
-    byok::portal::maybe_start(byok_service.clone(), token);
+    byok::portal::maybe_start(byok_service.clone(), automod_service.clone(), token);
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             owners,
@@ -445,7 +446,7 @@ async fn main() {
                         .commands
                         .iter()
                         .filter(|command| {
-                            !matches!(command.name.as_str(), "imagegen" | "imagine" | "imagegenstop" | "restart" | "voicejoin" | "voiceleave" | "voice")
+                            !matches!(command.name.as_str(), "imagegen" | "imagine" | "imagegenstop" | "restart" | "management" | "voicejoin" | "voiceleave" | "voice")
                         })
                         .flat_map(|command| {
                             poise::builtins::create_application_commands(std::slice::from_ref(
@@ -505,6 +506,7 @@ pub(crate) async fn register_instant_guild_commands(http: &serenity::Http, guild
         commands::ai::imagegen::imagine(),
         commands::ai::imagegen::imagegenstop(),
         commands::owner_commands::restart::restart(),
+        commands::management::management(),
     ];
     match voice::policy::allowed(guild_id).await {
         Ok(true) => commands.extend([

@@ -194,6 +194,15 @@ impl AutoModService {
         Ok(())
     }
 
+    pub(crate) fn cache_config(&self, guild_id: GuildId, config: AutoModConfig) {
+        if let Ok(mut cache) = self.config_cache.lock() {
+            if cache.len() >= 10_000 {
+                cache.clear();
+            }
+            cache.insert(guild_id.get(), (config, Instant::now()));
+        }
+    }
+
     fn user_lock(&self, guild_id: GuildId, user_id: UserId) -> Option<Arc<AsyncMutex<()>>> {
         let mut locks = self.user_locks.lock().ok()?;
         Some(

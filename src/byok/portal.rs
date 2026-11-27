@@ -1,7 +1,8 @@
 //! The only entry point for provider API keys. No key is accepted in Discord.
 //! Pairing, OAuth state and sessions are short-lived and process local; the
 //! connected credential is encrypted before MongoDB persistence.
-use super::{provider::AiProvider, storage::ByokService};
+use super::{management, provider::AiProvider, storage::ByokService};
+use crate::{automod::AutoModService, config::BOT_OWNERS, database};
 use axum::{
     Form, Router,
     extract::{Query, State},
@@ -10,7 +11,9 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use mongodb::bson::doc;
 use once_cell::sync::OnceCell;
+use poise::serenity_prelude::GuildId;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,6 +28,7 @@ use zeroize::Zeroizing;
 
 const COOKIE: &str = "omnicore_byok_session";
 const OAUTH_COOKIE: &str = "omnicore_byok_oauth";
+const MANAGEMENT_COOKIE: &str = "omnicore_management_session";
 const LINK_LIFE: Duration = Duration::from_secs(600);
 const SESSION_LIFE: Duration = Duration::from_secs(1800);
 
@@ -32,7 +36,14 @@ static PORTAL: OnceCell<Arc<Portal>> = OnceCell::new();
 
 struct Link {
     guild: u64,
+    kind: LinkKind,
+    requester: Option<u64>,
     until: Instant,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkKind {
+    Setup,
+    Management,
 }
 struct OAuthState {
     link: String,
@@ -53,6 +64,12 @@ struct Session {
     attempts: u8,
     pending: Option<Pending>,
 }
+struct ManagementSession {
+    guild: u64,
+    user: u64,
+    csrf: String,
+    until: Instant,
+}
 
 struct Portal {
     site: String,
@@ -61,10 +78,12 @@ struct Portal {
     client_secret: Zeroizing<String>,
     bot_token: Zeroizing<String>,
     service: Arc<ByokService>,
+    automod: Arc<AutoModService>,
     http: reqwest::Client,
     links: Mutex<HashMap<String, Link>>,
     oauth: Mutex<HashMap<String, OAuthState>>,
     sessions: Mutex<HashMap<String, Session>>,
+    management_sessions: Mutex<HashMap<String, ManagementSession>>,
 }
 
 fn random() -> String {
@@ -88,7 +107,7 @@ fn esc(value: &str) -> String {
 
 fn page(body: &str) -> Response {
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OmniCore secure AI setup</title><style>body{{background:#0d1120;color:#eef1ff;font:16px system-ui;margin:0;padding:3rem 1rem}}main{{max-width:640px;margin:auto}}section{{background:#1b2338;padding:1.5rem;border-radius:12px;margin:1rem 0}}label{{display:block;margin-top:1rem}}input,select,button{{box-sizing:border-box;width:100%;font:inherit;padding:.7rem;margin-top:.4rem;border-radius:7px;border:1px solid #7784aa}}button{{background:#7b72f4;color:white;cursor:pointer}}a{{color:#aaa5ff}}small{{color:#c6cee5}}</style></head><body><main><h1>OmniCore AI setup</h1>{body}<small>API usage may incur charges billed directly by your AI provider. Keys are encrypted before storage. Never enter an API key in Discord. Read our <a href=\"/privacy/\">Privacy Policy</a> and <a href=\"/terms/\">Terms of Service</a>.</small></main></body></html>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>OmniCore secure portal</title><style>body{{background:#0d1120;color:#eef1ff;font:16px system-ui;margin:0;padding:3rem 1rem}}main{{max-width:640px;margin:auto}}section{{background:#1b2338;padding:1.5rem;border-radius:12px;margin:1rem 0}}label{{display:block;margin-top:1rem}}input,select,button{{box-sizing:border-box;width:100%;font:inherit;padding:.7rem;margin-top:.4rem;border:1px solid #7784aa}}button{{background:#7b72f4;color:white;cursor:pointer}}a{{color:#aaa5ff}}small{{color:#c6cee5}}</style></head><body><main><h1>OmniCore secure portal</h1>{body}<small>API usage may incur charges billed directly by your AI provider. Keys are encrypted before storage. Never enter an API key in Discord. Read our <a href=\"/privacy/\">Privacy Policy</a> and <a href=\"/terms/\">Terms of Service</a>.</small></main></body></html>"
     );
     let mut response = Html(html).into_response();
     secure_headers(&mut response);
@@ -169,20 +188,63 @@ pub async fn create_setup_link(guild: u64) -> Result<Option<String>, &'static st
     let token = random();
     let mut links = portal.links.lock().await;
     links.retain(|_, link| link.until > Instant::now());
-    if links.values().filter(|link| link.guild == guild).count() >= 5 {
+    if links
+        .values()
+        .filter(|link| link.guild == guild && link.kind == LinkKind::Setup)
+        .count()
+        >= 5
+    {
         return Err("Too many setup links for this server; wait ten minutes");
     }
     links.insert(
         token.clone(),
         Link {
             guild,
+            kind: LinkKind::Setup,
+            requester: None,
             until: Instant::now() + LINK_LIFE,
         },
     );
     Ok(Some(format!("{}/connect/?token={token}", portal.site)))
 }
 
-pub fn maybe_start(service: Option<Arc<ByokService>>, bot_token: &str) {
+pub async fn create_management_link(guild: u64, requester: u64) -> Option<String> {
+    let portal = PORTAL.get()?;
+    let token = random();
+    let mut links = portal.links.lock().await;
+    links.retain(|_, link| {
+        link.until > Instant::now()
+            && !(link.kind == LinkKind::Management
+                && link.guild == guild
+                && link.requester == Some(requester))
+    });
+    links.insert(
+        token.clone(),
+        Link {
+            guild,
+            kind: LinkKind::Management,
+            requester: Some(requester),
+            until: Instant::now() + LINK_LIFE,
+        },
+    );
+    drop(links);
+    // A new command also closes any older unsaved session for this server and user.
+    portal
+        .management_sessions
+        .lock()
+        .await
+        .retain(|_, s| !(s.guild == guild && s.user == requester));
+    Some(format!(
+        "{}/connect/management/start?token={token}",
+        portal.site
+    ))
+}
+
+pub fn maybe_start(
+    service: Option<Arc<ByokService>>,
+    automod: Arc<AutoModService>,
+    bot_token: &str,
+) {
     let Some(service) = service else { return };
     let (Ok(client_id), Ok(client_secret)) = (
         std::env::var("OMNICORE_DISCORD_CLIENT_ID"),
@@ -215,10 +277,12 @@ pub fn maybe_start(service: Option<Arc<ByokService>>, bot_token: &str) {
         client_secret: Zeroizing::new(client_secret),
         bot_token: Zeroizing::new(bot_token.to_owned()),
         service,
+        automod,
         http: super::provider::client(),
         links: Mutex::new(HashMap::new()),
         oauth: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        management_sessions: Mutex::new(HashMap::new()),
     });
     if PORTAL.set(portal.clone()).is_err() {
         return;
@@ -250,11 +314,21 @@ pub fn maybe_start(service: Option<Arc<ByokService>>, bot_token: &str) {
                     session.pending = None;
                 }
             }
+            cleanup
+                .management_sessions
+                .lock()
+                .await
+                .retain(|_, session| session.until > now);
         }
     });
     tokio::spawn(async move {
         let app = Router::new()
             .route("/connect/", get(start))
+            .route("/connect/management/start", get(start))
+            .route(
+                "/connect/management",
+                get(management_get).post(management_save),
+            )
             .route("/connect/callback", get(callback))
             .route("/connect/manage", get(manage))
             .route("/connect/validate", post(validate))
@@ -282,7 +356,7 @@ struct StartQuery {
 }
 async fn start(State(portal): State<Arc<Portal>>, Query(query): Query<StartQuery>) -> Response {
     if query.token.len() != 43 {
-        return error_page(StatusCode::BAD_REQUEST, "This setup link is invalid.");
+        return error_page(StatusCode::BAD_REQUEST, "This link is invalid.");
     }
     let links = portal.links.lock().await;
     if !links
@@ -291,7 +365,7 @@ async fn start(State(portal): State<Arc<Portal>>, Query(query): Query<StartQuery
     {
         return error_page(
             StatusCode::BAD_REQUEST,
-            "This setup link has expired. Run /ai setup again.",
+            "This link has expired or was already used. Run the command again in Discord.",
         );
     }
     drop(links);
@@ -351,15 +425,21 @@ async fn callback(
     if auth.until <= Instant::now() {
         return error_page(StatusCode::FORBIDDEN, "Discord sign-in expired.");
     }
-    let guild = {
+    let link = {
         let mut links = portal.links.lock().await;
         let Some(link) = links.remove(&auth.link) else {
-            return error_page(StatusCode::FORBIDDEN, "This setup link was already used.");
+            return error_page(
+                StatusCode::GONE,
+                "This link was already used. Run the command again in Discord.",
+            );
         };
         if link.until <= Instant::now() {
-            return error_page(StatusCode::FORBIDDEN, "This setup link expired.");
+            return error_page(
+                StatusCode::GONE,
+                "This link expired. Run the command again in Discord.",
+            );
         }
-        link.guild
+        link
     };
     let token_result = portal
         .http
@@ -425,6 +505,30 @@ async fn callback(
             "Could not verify your Discord identity.",
         );
     };
+    if link.kind == LinkKind::Management {
+        if link.requester != Some(user) || portal.management_guild(link.guild, user).await.is_none()
+        {
+            return error_page(
+                StatusCode::FORBIDDEN,
+                "This management link belongs to another account or server ownership could not be verified.",
+            );
+        }
+        let id = random();
+        portal.management_sessions.lock().await.insert(
+            id.clone(),
+            ManagementSession {
+                guild: link.guild,
+                user,
+                csrf: random(),
+                until: Instant::now() + LINK_LIFE,
+            },
+        );
+        let mut response = redirect("/connect/management");
+        set_cookie(&mut response, MANAGEMENT_COOKIE, &id, 600);
+        set_cookie(&mut response, OAUTH_COOKIE, "", 0);
+        return response;
+    }
+    let guild = link.guild;
     if !portal.is_owner(guild, user).await {
         return error_page(
             StatusCode::FORBIDDEN,
@@ -450,6 +554,28 @@ async fn callback(
 }
 
 impl Portal {
+    async fn management_guild(&self, guild: u64, user: u64) -> Option<String> {
+        let response = self
+            .http
+            .get(format!("https://discord.com/api/v10/guilds/{guild}"))
+            .header("Authorization", format!("Bot {}", self.bot_token.as_str()))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.json::<Value>().await.ok()?;
+        let owner = body.get("owner_id")?.as_str()?.parse::<u64>().ok()?;
+        let bot_owner = BOT_OWNERS
+            .get()
+            .is_some_and(|owners| owners.contains(&user));
+        if user != owner && !bot_owner {
+            return None;
+        }
+        body.get("name").and_then(Value::as_str).map(str::to_owned)
+    }
+
     async fn is_owner(&self, guild: u64, user: u64) -> bool {
         let result = self
             .http
@@ -476,6 +602,150 @@ impl Portal {
         }
         Some((id, session.guild, session.user, session.csrf.clone()))
     }
+}
+
+async fn management_get(State(portal): State<Arc<Portal>>, headers: HeaderMap) -> Response {
+    let Some(id) = cookie(&headers, MANAGEMENT_COOKIE) else {
+        return error_page(
+            StatusCode::GONE,
+            "This management link has expired or was already saved. Run /management in Discord for a new link.",
+        );
+    };
+    let (guild, user, csrf) = {
+        let sessions = portal.management_sessions.lock().await;
+        let Some(session) = sessions.get(&id).filter(|s| s.until > Instant::now()) else {
+            return error_page(
+                StatusCode::GONE,
+                "This management link has expired or was already saved. Run /management in Discord for a new link.",
+            );
+        };
+        (session.guild, session.user, session.csrf.clone())
+    };
+    let Some(name) = portal.management_guild(guild, user).await else {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Server ownership or bot-owner access could not be verified.",
+        );
+    };
+    let Ok(automod) = portal.automod.load_config(GuildId::new(guild)).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AutoMod settings are temporarily unavailable.",
+        );
+    };
+    let Ok(limits) = portal.service.limits(guild).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI limits are temporarily unavailable.",
+        );
+    };
+    let Ok(usage) = portal.service.usage(guild).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI usage is temporarily unavailable.",
+        );
+    };
+    let provider = match portal.service.connection(guild).await {
+        Ok(Some(c)) => format!("{} / {}", c.provider.name(), c.model),
+        Ok(None) => "No provider connected".to_string(),
+        Err(_) => {
+            return error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AI connection is temporarily unavailable.",
+            );
+        }
+    };
+    let Ok(approved) = database::is_ai_approved(guild).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Local AI approval is temporarily unavailable.",
+        );
+    };
+    let mut response = Html(management::render(
+        &name, guild, &csrf, &automod, &limits, &usage, &provider, approved,
+    ))
+    .into_response();
+    secure_headers(&mut response);
+    response
+}
+
+async fn management_save(
+    State(portal): State<Arc<Portal>>,
+    headers: HeaderMap,
+    Form(form): Form<management::ManagementForm>,
+) -> Response {
+    if !origin_ok(&headers, &portal.site) {
+        return error_page(StatusCode::FORBIDDEN, "Invalid request origin.");
+    }
+    let Some(id) = cookie(&headers, MANAGEMENT_COOKIE) else {
+        return error_page(
+            StatusCode::GONE,
+            "This management link has expired or was already saved.",
+        );
+    };
+    let (guild, user, csrf) = {
+        let sessions = portal.management_sessions.lock().await;
+        let Some(session) = sessions.get(&id).filter(|s| s.until > Instant::now()) else {
+            return error_page(
+                StatusCode::GONE,
+                "This management link has expired or was already saved.",
+            );
+        };
+        (session.guild, session.user, session.csrf.clone())
+    };
+    if form.csrf != csrf || portal.management_guild(guild, user).await.is_none() {
+        return error_page(StatusCode::FORBIDDEN, "This request is not authorized.");
+    }
+    let Ok(mut automod) = portal.automod.load_config(GuildId::new(guild)).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AutoMod settings are temporarily unavailable.",
+        );
+    };
+    let Ok(mut limits) = portal.service.limits(guild).await else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI limits are temporarily unavailable.",
+        );
+    };
+    if let Err(message) = form.apply(&mut automod, &mut limits) {
+        return error_page(StatusCode::BAD_REQUEST, message);
+    }
+    // Consuming the session under the lock makes concurrent submissions single-use.
+    let removed = portal.management_sessions.lock().await.remove(&id);
+    if !removed.is_some_and(|s| {
+        s.guild == guild && s.user == user && s.csrf == csrf && s.until > Instant::now()
+    }) {
+        return error_page(
+            StatusCode::GONE,
+            "This management link has expired or was already saved.",
+        );
+    }
+    let result = database::get_collection(database::GUILD_SETTINGS);
+    let Ok(collection) = result else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Settings storage is unavailable. Run /management for a new link.",
+        );
+    };
+    let update = doc! { "$set": { "automod": automod.to_document(), "ai_byok": limits.to_document() }, "$setOnInsert": { "guild_id": guild.to_string(), "prefix": "!", "ai_approved": false } };
+    if collection
+        .update_one(doc! { "guild_id": guild.to_string() }, update)
+        .upsert(true)
+        .await
+        .is_err()
+    {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Settings could not be saved. Run /management for a new link.",
+        );
+    }
+    portal.automod.cache_config(GuildId::new(guild), automod);
+    let mut response = page(
+        "<section><h2>Settings saved</h2><p>Your server settings are active. This management link and session are now closed. Run /management in Discord to make more changes.</p></section>",
+    );
+    set_cookie(&mut response, MANAGEMENT_COOKIE, "", 0);
+    response
 }
 
 fn form_shell(guild: u64, csrf: &str, current: &str, extra: &str) -> Response {
