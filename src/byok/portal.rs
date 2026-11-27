@@ -5,7 +5,7 @@ use super::{management, provider::AiProvider, storage::ByokService};
 use crate::{automod::AutoModService, config::BOT_OWNERS, database};
 use axum::{
     Form, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -68,7 +68,14 @@ struct ManagementSession {
     guild: u64,
     user: u64,
     csrf: String,
+    page: String,
     until: Instant,
+}
+
+impl ManagementSession {
+    fn allows_page(&self, page: &str) -> bool {
+        self.page == page && self.until > Instant::now()
+    }
 }
 
 struct Portal {
@@ -327,6 +334,10 @@ pub fn maybe_start(
             .route("/connect/management/start", get(start))
             .route(
                 "/connect/management",
+                get(management_missing).post(management_missing),
+            )
+            .route(
+                "/connect/management/{page}",
                 get(management_get).post(management_save),
             )
             .route("/connect/callback", get(callback))
@@ -514,16 +525,18 @@ async fn callback(
             );
         }
         let id = random();
+        let page = random();
         portal.management_sessions.lock().await.insert(
             id.clone(),
             ManagementSession {
                 guild: link.guild,
                 user,
                 csrf: random(),
+                page: page.clone(),
                 until: Instant::now() + LINK_LIFE,
             },
         );
-        let mut response = redirect("/connect/management");
+        let mut response = redirect(&format!("/connect/management/{page}"));
         set_cookie(&mut response, MANAGEMENT_COOKIE, &id, 600);
         set_cookie(&mut response, OAUTH_COOKIE, "", 0);
         return response;
@@ -604,7 +617,18 @@ impl Portal {
     }
 }
 
-async fn management_get(State(portal): State<Arc<Portal>>, headers: HeaderMap) -> Response {
+async fn management_missing() -> Response {
+    error_page(
+        StatusCode::GONE,
+        "This management page requires a fresh private link. Run /management in Discord.",
+    )
+}
+
+async fn management_get(
+    State(portal): State<Arc<Portal>>,
+    Path(page_nonce): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let Some(id) = cookie(&headers, MANAGEMENT_COOKIE) else {
         return error_page(
             StatusCode::GONE,
@@ -613,7 +637,7 @@ async fn management_get(State(portal): State<Arc<Portal>>, headers: HeaderMap) -
     };
     let (guild, user, csrf) = {
         let sessions = portal.management_sessions.lock().await;
-        let Some(session) = sessions.get(&id).filter(|s| s.until > Instant::now()) else {
+        let Some(session) = sessions.get(&id).filter(|s| s.allows_page(&page_nonce)) else {
             return error_page(
                 StatusCode::GONE,
                 "This management link has expired or was already saved. Run /management in Discord for a new link.",
@@ -662,7 +686,15 @@ async fn management_get(State(portal): State<Arc<Portal>>, headers: HeaderMap) -
         );
     };
     let mut response = Html(management::render(
-        &name, guild, &csrf, &automod, &limits, &usage, &provider, approved,
+        &name,
+        guild,
+        &csrf,
+        &page_nonce,
+        &automod,
+        &limits,
+        &usage,
+        &provider,
+        approved,
     ))
     .into_response();
     secure_headers(&mut response);
@@ -671,6 +703,7 @@ async fn management_get(State(portal): State<Arc<Portal>>, headers: HeaderMap) -
 
 async fn management_save(
     State(portal): State<Arc<Portal>>,
+    Path(page_nonce): Path<String>,
     headers: HeaderMap,
     Form(form): Form<management::ManagementForm>,
 ) -> Response {
@@ -685,7 +718,7 @@ async fn management_save(
     };
     let (guild, user, csrf) = {
         let sessions = portal.management_sessions.lock().await;
-        let Some(session) = sessions.get(&id).filter(|s| s.until > Instant::now()) else {
+        let Some(session) = sessions.get(&id).filter(|s| s.allows_page(&page_nonce)) else {
             return error_page(
                 StatusCode::GONE,
                 "This management link has expired or was already saved.",
@@ -714,7 +747,7 @@ async fn management_save(
     // Consuming the session under the lock makes concurrent submissions single-use.
     let removed = portal.management_sessions.lock().await.remove(&id);
     if !removed.is_some_and(|s| {
-        s.guild == guild && s.user == user && s.csrf == csrf && s.until > Instant::now()
+        s.guild == guild && s.user == user && s.csrf == csrf && s.allows_page(&page_nonce)
     }) {
         return error_page(
             StatusCode::GONE,
@@ -950,6 +983,22 @@ async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_page_requires_its_own_live_nonce() {
+        let mut session = ManagementSession {
+            guild: 1,
+            user: 2,
+            csrf: random(),
+            page: random(),
+            until: Instant::now() + LINK_LIFE,
+        };
+        assert!(session.allows_page(&session.page));
+        assert!(!session.allows_page("another-page"));
+        session.until = Instant::now() - Duration::from_secs(1);
+        assert!(!session.allows_page(&session.page));
+    }
+
     #[test]
     fn cookie_parser_requires_exact_name_and_token_shape() {
         let mut headers = HeaderMap::new();

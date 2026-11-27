@@ -139,6 +139,7 @@ pub(super) fn render(
     guild_name: &str,
     guild: u64,
     csrf: &str,
+    page: &str,
     automod: &AutoModConfig,
     limits: &Limits,
     usage: &UsageSummary,
@@ -148,6 +149,7 @@ pub(super) fn render(
     let name = esc(guild_name);
     let provider = esc(provider);
     let csrf = esc(csrf);
+    let page = esc(page);
     let sensitivity = ["low", "normal", "high"]
         .iter()
         .map(|v| option(v, automod.sensitivity.name()))
@@ -158,7 +160,7 @@ pub(super) fn render(
 *{{box-sizing:border-box}}body{{margin:0;background:#0b1222;color:#eef3ff;font:16px system-ui,sans-serif;line-height:1.5}}main{{width:min(900px,calc(100% - 32px));margin:32px auto 80px}}header{{border-bottom:1px solid #34435f;padding-bottom:20px}}h1{{font-size:clamp(28px,5vw,42px);line-height:1.1;margin:8px 0}}h2{{margin:0 0 12px;font-size:23px}}p{{color:#c1cee5}}.eyebrow{{color:#75d6e9;font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:12px}}.panel{{background:#18243a;border:1px solid #324463;border-radius:14px;padding:24px;margin:20px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px}}label{{display:block;color:#eaf0fc;font-weight:600}}label span{{display:block;color:#afbed6;font-size:13px;font-weight:400}}input[type=number],select{{width:100%;padding:10px;margin-top:6px;background:#0c1729;color:white;border:1px solid #657798;border-radius:7px;font:inherit}}.check{{display:flex;align-items:flex-start;gap:10px;margin:10px 0}}.check input{{width:19px;height:19px;flex:none;accent-color:#67ccf0}}.metric{{font-size:25px;font-weight:700;margin:0}}.muted{{color:#aabbd2;font-size:14px}}button{{background:#57c6e7;border:0;border-radius:8px;padding:13px 22px;color:#071321;font:inherit;font-weight:800;cursor:pointer}}button:hover{{background:#8cdeee}}a{{color:#8cdeee}}:focus-visible{{outline:3px solid #f5c95c;outline-offset:3px}}
 </style></head><body><main><header><div class="eyebrow">OmniCore server management</div><h1>{name}</h1><p>Server ID: {guild}. Signed in with Discord. Your private link expires in 10 minutes and can be saved once.</p></header>
 <section class="panel"><h2>Provider AI connection and usage</h2><p>Connected provider: {provider}. Local AI operator approval: {}.</p><div class="grid"><div><p class="metric">{}</p><span class="muted">Provider requests, past 30 days</span></div><div><p class="metric">{}</p><span class="muted">Successful</span></div><div><p class="metric">{}</p><span class="muted">Failed</span></div><div><p class="metric">{} / {}</p><span class="muted">Input / output tokens reported</span></div><div><p class="metric">{}</p><span class="muted">Provider vision requests</span></div></div><p class="muted">Local Ollama requests are not included. Token totals reflect provider reports and may be incomplete. Use /ai setup to connect or change a provider; credentials are never shown here.</p></section>
-<form action="/connect/management" method="post"><input type="hidden" name="csrf" value="{csrf}">
+<form action="/connect/management/{page}" method="post"><input type="hidden" name="csrf" value="{csrf}">
 <section class="panel"><h2>AutoMod</h2><label class="check"><input type="checkbox" name="automod_enabled" value="on" {}> Enable AutoMod</label><label class="check"><input type="checkbox" name="warnings_enabled" value="on" {}> Issue warnings</label><label class="check"><input type="checkbox" name="timeouts_enabled" value="on" {}> Apply automatic timeouts</label><label class="check"><input type="checkbox" name="notify_owner" value="on" {}> Notify server owner</label><div class="grid"><label>Sensitivity<select name="sensitivity">{sensitivity}</select></label><label>Moderate timeout (minutes)<input type="number" name="moderate_minutes" min="1" max="2880" required value="{}"></label><label>Serious timeout (minutes)<input type="number" name="serious_minutes" min="1" max="2880" required value="{}"></label><label>Severe timeout (minutes)<input type="number" name="severe_minutes" min="1" max="2880" required value="{}"></label><label>Extreme timeout (minutes)<input type="number" name="extreme_minutes" min="1" max="2880" required value="{}"></label></div></section>
 <section class="panel"><h2>AI limits</h2><p class="muted">These limits apply to a connected provider. Operator-approved local AI follows its own route.</p><div class="grid"><label>Requests per user per day<input type="number" name="user_daily" min="1" max="1000" required value="{}"></label><label>Requests per server per day<input type="number" name="guild_daily" min="1" max="100000" required value="{}"></label><label>Maximum output tokens<input type="number" name="output_tokens" min="32" max="4096" required value="{}"></label><label>Concurrent requests<input type="number" name="concurrency" min="1" max="16" required value="{}"></label></div><label class="check"><input type="checkbox" name="vision_enabled" value="on" {}> Allow provider image recognition</label><div class="grid"><label>Maximum images per request<input type="number" name="max_images" min="1" max="3" required value="{}"></label></div><label class="check"><input type="checkbox" name="dm_vision_enabled" value="on" {}> Allow server-owner DM vision with this provider key</label><p class="muted">Provider usage may incur charges. Existing channel, role, and model choices are preserved. Use /ai commands for those settings.</p></section>
 <button type="submit">Save changes and close link</button></form><p class="muted">After Save, this page and its link cannot be reused. Run /management again to make more changes.</p></main></body></html>"#,
@@ -241,6 +243,7 @@ mod tests {
             "<script>alert(1)</script>",
             42,
             "csrf",
+            "page",
             &AutoModConfig::default(),
             &Limits::default(),
             &UsageSummary::default(),
@@ -250,5 +253,6 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("model&quot; onfocus=&quot;alert(1)"));
+        assert!(html.contains("action=\"/connect/management/page\""));
     }
 }
